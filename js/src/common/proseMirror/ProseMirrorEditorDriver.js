@@ -37,42 +37,42 @@ export default class ProseMirrorEditorDriver {
     const cssClasses = attrs.classNames || [];
     cssClasses.forEach((className) => this.view.dom.classList.add(className));
 
-    // ===== textarea 兼容层（供 styleSelectedText / insertText.ts 使用）=====
+    // ===== textarea 兼容层（完全模拟字符串下标语义）=====
     const self = this;
 
-    const valueProxy = {
-      slice(start, end) {
-        const doc = self.view.state.doc;
-        const s = typeof start === 'number' ? start : 0;
-        const e = typeof end === 'number' ? end : doc.content.size;
-        return doc.textBetween(s, e, '\n', '\n');
-      },
-      toString() {
-        const doc = self.view.state.doc;
-        return doc.textBetween(0, doc.content.size, '\n', '\n');
-      },
-      // 兼容某些 endsWith 检查
-      endsWith(str) {
-        return this.toString().endsWith(str);
-      },
-      // 给个大概 length（仅极少地方会用到；按 doc.size 返回）
-      get length() {
-        return self.view.state.doc.content.size;
-      },
+    // 把“PM 文档位置” <-> “纯文本字符下标” 互相转换
+    const TEXT_SEP = '\n';
+    const textAll = () => self.view.state.doc.textBetween(0, self.view.state.doc.content.size, TEXT_SEP, TEXT_SEP);
+    const charIdxToPos = (idx) => {
+      // 二分查找：找到最小 pos 使 textBetween(0,pos).length >= idx
+      let lo = 0;
+      let hi = self.view.state.doc.content.size;
+      idx = Math.max(0, Math.min(idx, textAll().length));
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        const len = self.view.state.doc.textBetween(0, mid, TEXT_SEP, TEXT_SEP).length;
+        if (len < idx) lo = mid + 1;
+        else hi = mid;
+      }
+      return lo;
     };
+    const posToCharIdx = (pos) => self.view.state.doc.textBetween(0, pos, TEXT_SEP, TEXT_SEP).length;
 
+    // 供 styleSelectedText / insertText.ts 使用
     this.el = {
+      // 聚焦
       focus() {
         self.view.focus();
       },
-      // getter：返回带 slice 的代理对象
+
+      // value：字符串 getter + setter（整篇替换）
       get value() {
-        return valueProxy;
+        return textAll();
       },
-      // setter：整篇替换为新文本
       set value(v) {
+        const s = String(v);
         try {
-          const newDoc = self.parser.parse(v);
+          const newDoc = self.parser.parse(s);
           const newState = EditorState.create({
             doc: newDoc,
             schema: self.schema,
@@ -80,39 +80,49 @@ export default class ProseMirrorEditorDriver {
           });
           self.view.updateState(newState);
         } catch (e) {
-          self.view.dispatch(self.view.state.tr.insertText(String(v), 0, self.view.state.doc.content.size));
+          self.view.dispatch(self.view.state.tr.insertText(s, 0, self.view.state.doc.content.size));
         }
         self.view.focus();
       },
 
+      // selectionStart/End：以“字符串下标”表示
       get selectionStart() {
-        return self.view.state.selection.from;
+        return posToCharIdx(self.view.state.selection.from);
       },
       get selectionEnd() {
-        return self.view.state.selection.to;
+        return posToCharIdx(self.view.state.selection.to);
       },
 
-      // 用于“更好的途径”替换选区（虽然 insertText.ts 主要走 value 路径）
+      // setRangeText：参数也是“字符串下标”，内部转为 PM 位置后替换
       setRangeText(text, start, end /*, mode */) {
-        const s = typeof start === 'number' ? start : self.view.state.selection.from;
-        const e = typeof end === 'number' ? end : self.view.state.selection.to;
-        self.view.dispatch(self.view.state.tr.insertText(text, s, e));
+        const s = charIdxToPos(typeof start === 'number' ? start : this.selectionStart);
+        const e = charIdxToPos(typeof end === 'number' ? end : this.selectionEnd);
+        self.view.dispatch(self.view.state.tr.insertText(String(text), s, e));
         self.view.focus();
       },
 
+      // setSelectionRange：把字符串下标映射回 PM 位置
       setSelectionRange(start, end) {
-        const $s = self.view.state.tr.doc.resolve(start);
-        const $e = self.view.state.tr.doc.resolve(end);
+        const s = charIdxToPos(start);
+        const e = charIdxToPos(end);
+        const $s = self.view.state.tr.doc.resolve(s);
+        const $e = self.view.state.tr.doc.resolve(e);
         self.view.dispatch(self.view.state.tr.setSelection(new TextSelection($s, $e)));
         self.view.focus();
       },
 
-      // insertText.ts 会调这一句；我们做 no-op 即可
+      // insertText.ts 的回退会调这个；给个 no-op 即可
       dispatchEvent(/* ev */) {
         return true;
       },
+
+      // 兼容 insertText.ts 临时设置 contentEditable
+      set contentEditable(_v) {},
+      get contentEditable() {
+        return 'false';
+      },
     };
-    // ======================================================
+    // =====================================================
 
     const callInputListeners = (e) => {
       this.attrs.inputListeners.forEach((listener) => {
@@ -157,11 +167,10 @@ export default class ProseMirrorEditorDriver {
 
   buildEditorProps() {
     const self = this;
-
     return {
       state: this.state,
       dispatchTransaction(transaction) {
-        let newState = this.state.apply(transaction);
+        const newState = this.state.apply(transaction);
         this.updateState(newState);
 
         const newDoc = this.state.doc;
@@ -183,7 +192,7 @@ export default class ProseMirrorEditorDriver {
     return this.serializer.serialize(doc, { tightLists: true });
   }
 
-  // ===== 外部 API（原样保留）=====
+  // === 以下保留原 API ===
   moveCursorTo(position) {
     this.setSelectionRange(position, position);
   }
@@ -220,7 +229,12 @@ export default class ProseMirrorEditorDriver {
       trailingNewLines = text.match(/\s+$/)[0].split('\n').length - 1;
     }
 
-    this.moveCursorTo(Math.min(start + text.length + OFFSET_TO_REMOVE_PREFIX_NEWLINE, Selection.atEnd(this.view.state.doc).to));
+    this.moveCursorTo(
+      Math.min(
+        start + text.length + OFFSET_TO_REMOVE_PREFIX_NEWLINE,
+        Selection.atEnd(this.view.state.doc).to
+      )
+    );
     m.redraw();
 
     if (text.endsWith(' ') && !escape) {
@@ -250,7 +264,7 @@ export default class ProseMirrorEditorDriver {
     const editorViewportOffset = this.view.dom.getBoundingClientRect();
     return {
       left: viewportCoords.left - editorViewportOffset.left,
-      top: viewportCoords.top - editorViewportOffset.top,
+      top: viewportCoords.top - editorViewportTop,
     };
   }
 
