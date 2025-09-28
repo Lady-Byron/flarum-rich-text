@@ -37,23 +37,16 @@ export default class ProseMirrorEditorDriver {
     const cssClasses = attrs.classNames || [];
     cssClasses.forEach((className) => this.view.dom.classList.add(className));
 
-    // ===== textarea 兼容层（供 styleSelectedText 使用）======
-    // 让 this.el 看起来像一个 <textarea>，从而兼容依赖 textarea API 的扩展
-    // 注意：这里的“索引”直接使用 ProseMirror 的 doc position 空间。
+    // ===== textarea 兼容层（供 styleSelectedText 使用） =====
     const self = this;
     this.el = {
       focus() {
         self.view.focus();
       },
-      // 仅实现 styleSelectedText 需要的 API：value.slice(start, end)
-      // 把 PM 文档在 [start, end) 区间的纯文本取出；段落之间用换行隔开
-      value: {
-        slice(start, end) {
-          const doc = self.view.state.doc;
-          const s = typeof start === 'number' ? start : 0;
-          const e = typeof end === 'number' ? end : doc.content.size;
-          return doc.textBetween(s, e, '\n', '\n');
-        },
+      // 返回整个文档的纯文本；styleSelectedText 期望这是“字符串”
+      get value() {
+        const doc = self.view.state.doc;
+        return doc.textBetween(0, doc.content.size, '\n', '\n');
       },
       get selectionStart() {
         return self.view.state.selection.from;
@@ -61,14 +54,12 @@ export default class ProseMirrorEditorDriver {
       get selectionEnd() {
         return self.view.state.selection.to;
       },
-      // 将 [start, end) 替换为给定文本
       setRangeText(text, start, end /*, mode */) {
         const s = typeof start === 'number' ? start : self.view.state.selection.from;
         const e = typeof end === 'number' ? end : self.view.state.selection.to;
         self.view.dispatch(self.view.state.tr.insertText(text, s, e));
         self.view.focus();
       },
-      // 设置当前选区
       setSelectionRange(start, end) {
         const $s = self.view.state.tr.doc.resolve(start);
         const $e = self.view.state.tr.doc.resolve(end);
@@ -82,7 +73,6 @@ export default class ProseMirrorEditorDriver {
       this.attrs.inputListeners.forEach((listener) => {
         listener.call(target);
       });
-
       e.redraw = false;
     };
 
@@ -104,29 +94,17 @@ export default class ProseMirrorEditorDriver {
     const items = new ItemList();
 
     items.add('markdownInputrules', inputRules({ rules: this.buildInputRules(this.schema) }));
-
     items.add('submit', keymap({ 'Mod-Enter': this.attrs.onsubmit }));
-
     items.add('escape', keymap({ Escape: this.attrs.escape }));
-
     items.add('richTextKeymap', keymap(richTextKeymap(this.schema)));
-
     items.add('baseKeymap', keymap(baseKeymap));
-
     items.add('placeholder', placeholderPlugin(this.attrs.placeholder));
-
     items.add('history', history());
-
     items.add('disabled', disabledPlugin());
-
     items.add('disableBase64Paste', disableBase64PastePlugin());
-
     items.add('dropCursor', dropCursor());
-
     items.add('gapCursor', gapCursor());
-
     items.add('menu', menuPlugin(this.attrs.menuState));
-
     items.add('toggleSpoiler', toggleSpoiler(this.schema));
 
     return items;
@@ -162,89 +140,47 @@ export default class ProseMirrorEditorDriver {
 
   // External Control Stuff
 
-  /**
-   * Focus the textarea and place the cursor at the given index.
-   *
-   * @param {number} position
-   */
   moveCursorTo(position) {
     this.setSelectionRange(position, position);
   }
 
-  /**
-   * Get the selected range of the textarea.
-   *
-   * @return {Array}
-   */
   getSelectionRange() {
     return [this.view.state.selection.from, this.view.state.selection.to];
   }
 
-  /**
-   * Get (at most) the last N characters from the current "text block".
-   */
   getLastNChars(n) {
     const lastNode = this.view.state.selection.$from.nodeBefore;
-
     if (!lastNode || !lastNode.text) return '';
-
     return lastNode.text.slice(Math.max(0, lastNode.text.length - n));
   }
 
-  /**
-   * Insert content into the textarea at the position of the cursor.
-   *
-   * @param {String} text
-   */
   insertAtCursor(text, escape) {
     this.insertAt(this.getSelectionRange()[0], text, escape);
     $(this.view.dom).trigger('click');
   }
 
-  /**
-   * Insert content into the textarea at the given position.
-   *
-   * @param {number} pos
-   * @param {String} text
-   */
   insertAt(pos, text, escape) {
     this.insertBetween(pos, pos, text, escape);
   }
 
-  /**
-   * Insert content into the textarea between the given positions.
-   *
-   * If the start and end positions are different, any text between them will be
-   * overwritten.
-   *
-   * @param start
-   * @param end
-   * @param text
-   * @param rawMarkdown
-   */
   insertBetween(start, end, text, escape = true) {
     let trailingNewLines = 0;
-
     const OFFSET_TO_REMOVE_PREFIX_NEWLINE = 1;
 
     if (escape) {
       this.view.dispatch(this.view.state.tr.insertText(text, start, end));
     } else {
-      // Without this, a newline would be added before the inserted text.
       start -= OFFSET_TO_REMOVE_PREFIX_NEWLINE;
       const parsedText = this.parseInitialValue(text);
       this.view.dispatch(this.view.state.tr.replaceRangeWith(start, end, parsedText));
-
       trailingNewLines = text.match(/\s+$/)[0].split('\n').length - 1;
     }
 
-    // Move the textarea cursor to the end of the content we just inserted.
-    // The offset is necessary so the new cursor position doesn't split the inserted text
-    // when the space is added below.
-    this.moveCursorTo(Math.min(start + text.length + OFFSET_TO_REMOVE_PREFIX_NEWLINE, Selection.atEnd(this.view.state.doc).to));
+    this.moveCursorTo(
+      Math.min(start + text.length + OFFSET_TO_REMOVE_PREFIX_NEWLINE, Selection.atEnd(this.view.state.doc).to)
+    );
     m.redraw();
 
-    // TODO: accomplish this in one step.
     if (text.endsWith(' ') && !escape) {
       this.insertAtCursor(' ');
     }
@@ -256,27 +192,13 @@ export default class ProseMirrorEditorDriver {
       });
   }
 
-  /**
-   * Replace existing content from the start to the current cursor position.
-   *
-   * @param start
-   * @param text
-   */
   replaceBeforeCursor(start, text, escape) {
     this.insertBetween(start, this.getSelectionRange()[0], text, escape);
   }
 
-  /**
-   * Set the selected range of the textarea.
-   *
-   * @param {number} start
-   * @param {number} end
-   * @private
-   */
   setSelectionRange(start, end) {
     const $start = this.view.state.tr.doc.resolve(start);
     const $end = this.view.state.tr.doc.resolve(end);
-
     this.view.dispatch(this.view.state.tr.setSelection(new TextSelection($start, $end)));
     this.focus();
   }
