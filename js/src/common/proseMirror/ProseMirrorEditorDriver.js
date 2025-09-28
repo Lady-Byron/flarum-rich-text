@@ -37,6 +37,47 @@ export default class ProseMirrorEditorDriver {
     const cssClasses = attrs.classNames || [];
     cssClasses.forEach((className) => this.view.dom.classList.add(className));
 
+    // ===== textarea 兼容层（供 styleSelectedText 使用）======
+    // 让 this.el 看起来像一个 <textarea>，从而兼容依赖 textarea API 的扩展
+    // 注意：这里的“索引”直接使用 ProseMirror 的 doc position 空间。
+    const self = this;
+    this.el = {
+      focus() {
+        self.view.focus();
+      },
+      // 仅实现 styleSelectedText 需要的 API：value.slice(start, end)
+      // 把 PM 文档在 [start, end) 区间的纯文本取出；段落之间用换行隔开
+      value: {
+        slice(start, end) {
+          const doc = self.view.state.doc;
+          const s = typeof start === 'number' ? start : 0;
+          const e = typeof end === 'number' ? end : doc.content.size;
+          return doc.textBetween(s, e, '\n', '\n');
+        },
+      },
+      get selectionStart() {
+        return self.view.state.selection.from;
+      },
+      get selectionEnd() {
+        return self.view.state.selection.to;
+      },
+      // 将 [start, end) 替换为给定文本
+      setRangeText(text, start, end /*, mode */) {
+        const s = typeof start === 'number' ? start : self.view.state.selection.from;
+        const e = typeof end === 'number' ? end : self.view.state.selection.to;
+        self.view.dispatch(self.view.state.tr.insertText(text, s, e));
+        self.view.focus();
+      },
+      // 设置当前选区
+      setSelectionRange(start, end) {
+        const $s = self.view.state.tr.doc.resolve(start);
+        const $e = self.view.state.tr.doc.resolve(end);
+        self.view.dispatch(self.view.state.tr.setSelection(new TextSelection($s, $e)));
+        self.view.focus();
+      },
+    };
+    // =======================================================
+
     const callInputListeners = (e) => {
       this.attrs.inputListeners.forEach((listener) => {
         listener.call(target);
