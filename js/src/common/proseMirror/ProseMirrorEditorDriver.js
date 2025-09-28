@@ -171,7 +171,7 @@ export default class ProseMirrorEditorDriver {
     items.add('richTextKeymap', keymap(richTextKeymap(this.schema)));
     items.add('baseKeymap', keymap(baseKeymap));
     items.add('placeholder', placeholderPlugin(this.attrs.placeholder));
-    items.add('history', history()));
+    items.add('history', history());
     items.add('disabled', disabledPlugin());
     items.add('disableBase64Paste', disableBase64PastePlugin());
     items.add('dropCursor', dropCursor());
