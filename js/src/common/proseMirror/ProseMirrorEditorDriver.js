@@ -37,29 +37,51 @@ export default class ProseMirrorEditorDriver {
     const cssClasses = attrs.classNames || [];
     cssClasses.forEach((className) => this.view.dom.classList.add(className));
 
-    // ===== textarea 兼容层（供 styleSelectedText 使用） =====
+    // ===== textarea 兼容层：供 styleSelectedText / insertText.ts 使用 =====
     const self = this;
     this.el = {
       focus() {
         self.view.focus();
       },
-      // 返回整个文档的纯文本；styleSelectedText 期望这是“字符串”
+
+      // value：字符串 getter + setter
       get value() {
         const doc = self.view.state.doc;
         return doc.textBetween(0, doc.content.size, '\n', '\n');
       },
+      set value(v) {
+        try {
+          // 用 RTE 自带的解析器把整篇文本替换成新内容（保持插件/快捷键等）
+          const newDoc = self.parser.parse(v);
+          const newState = EditorState.create({
+            doc: newDoc,
+            schema: self.schema,
+            plugins: self.view.state.plugins,
+          });
+          self.view.updateState(newState);
+        } catch (e) {
+          // 兜底：直接把全文替换为纯文本
+          self.view.dispatch(self.view.state.tr.insertText(v, 0, self.view.state.doc.content.size));
+        }
+        self.view.focus();
+      },
+
       get selectionStart() {
         return self.view.state.selection.from;
       },
       get selectionEnd() {
         return self.view.state.selection.to;
       },
+
+      // 替换 [start, end) 为给定文本
       setRangeText(text, start, end /*, mode */) {
         const s = typeof start === 'number' ? start : self.view.state.selection.from;
         const e = typeof end === 'number' ? end : self.view.state.selection.to;
         self.view.dispatch(self.view.state.tr.insertText(text, s, e));
         self.view.focus();
       },
+
+      // 设置选区
       setSelectionRange(start, end) {
         const $s = self.view.state.tr.doc.resolve(start);
         const $e = self.view.state.tr.doc.resolve(end);
@@ -67,7 +89,7 @@ export default class ProseMirrorEditorDriver {
         self.view.focus();
       },
     };
-    // =======================================================
+    // ================================================================
 
     const callInputListeners = (e) => {
       this.attrs.inputListeners.forEach((listener) => {
@@ -138,7 +160,7 @@ export default class ProseMirrorEditorDriver {
     return this.serializer.serialize(doc, { tightLists: true });
   }
 
-  // External Control Stuff
+  // ===== 外部控制 API（原样保留） =====
 
   moveCursorTo(position) {
     this.setSelectionRange(position, position);
@@ -176,9 +198,7 @@ export default class ProseMirrorEditorDriver {
       trailingNewLines = text.match(/\s+$/)[0].split('\n').length - 1;
     }
 
-    this.moveCursorTo(
-      Math.min(start + text.length + OFFSET_TO_REMOVE_PREFIX_NEWLINE, Selection.atEnd(this.view.state.doc).to)
-    );
+    this.moveCursorTo(Math.min(start + text.length + OFFSET_TO_REMOVE_PREFIX_NEWLINE, Selection.atEnd(this.view.state.doc).to));
     m.redraw();
 
     if (text.endsWith(' ') && !escape) {
