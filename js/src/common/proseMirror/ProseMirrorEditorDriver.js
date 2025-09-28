@@ -40,14 +40,20 @@ export default class ProseMirrorEditorDriver {
     // ===== textarea 兼容层（完全模拟字符串下标语义）=====
     const self = this;
 
-    // 把“PM 文档位置” <-> “纯文本字符下标” 互相转换
+    // PM 位置 <-> 纯文本字符下标 映射
     const TEXT_SEP = '\n';
-    const textAll = () => self.view.state.doc.textBetween(0, self.view.state.doc.content.size, TEXT_SEP, TEXT_SEP);
+    const textAll = () =>
+      self.view.state.doc.textBetween(0, self.view.state.doc.content.size, TEXT_SEP, TEXT_SEP);
+
+    const posToCharIdx = (pos) =>
+      self.view.state.doc.textBetween(0, pos, TEXT_SEP, TEXT_SEP).length;
+
     const charIdxToPos = (idx) => {
-      // 二分查找：找到最小 pos 使 textBetween(0,pos).length >= idx
+      // 二分：找最小 pos 使 textBetween(0,pos).length >= idx
       let lo = 0;
       let hi = self.view.state.doc.content.size;
-      idx = Math.max(0, Math.min(idx, textAll().length));
+      const total = textAll().length;
+      idx = Math.max(0, Math.min(idx, total));
       while (lo < hi) {
         const mid = (lo + hi) >> 1;
         const len = self.view.state.doc.textBetween(0, mid, TEXT_SEP, TEXT_SEP).length;
@@ -56,7 +62,6 @@ export default class ProseMirrorEditorDriver {
       }
       return lo;
     };
-    const posToCharIdx = (pos) => self.view.state.doc.textBetween(0, pos, TEXT_SEP, TEXT_SEP).length;
 
     // 供 styleSelectedText / insertText.ts 使用
     this.el = {
@@ -80,28 +85,40 @@ export default class ProseMirrorEditorDriver {
           });
           self.view.updateState(newState);
         } catch (e) {
-          self.view.dispatch(self.view.state.tr.insertText(s, 0, self.view.state.doc.content.size));
+          self.view.dispatch(
+            self.view.state.tr.insertText(s, 0, self.view.state.doc.content.size)
+          );
         }
         self.view.focus();
       },
 
-      // selectionStart/End：以“字符串下标”表示
+      // selectionStart/End：字符下标语义（含 setter）
       get selectionStart() {
         return posToCharIdx(self.view.state.selection.from);
+      },
+      set selectionStart(v) {
+        const end = this.selectionEnd;
+        this.setSelectionRange(Number(v), end);
       },
       get selectionEnd() {
         return posToCharIdx(self.view.state.selection.to);
       },
+      set selectionEnd(v) {
+        const start = this.selectionStart;
+        this.setSelectionRange(start, Number(v));
+      },
 
-      // setRangeText：参数也是“字符串下标”，内部转为 PM 位置后替换
+      // setRangeText：把字符区间映射为 PM 位置后替换
       setRangeText(text, start, end /*, mode */) {
-        const s = charIdxToPos(typeof start === 'number' ? start : this.selectionStart);
-        const e = charIdxToPos(typeof end === 'number' ? end : this.selectionEnd);
+        const s =
+          typeof start === 'number' ? charIdxToPos(start) : charIdxToPos(this.selectionStart);
+        const e =
+          typeof end === 'number' ? charIdxToPos(end) : charIdxToPos(this.selectionEnd);
         self.view.dispatch(self.view.state.tr.insertText(String(text), s, e));
         self.view.focus();
       },
 
-      // setSelectionRange：把字符串下标映射回 PM 位置
+      // setSelectionRange：字符下标 -> PM 位置
       setSelectionRange(start, end) {
         const s = charIdxToPos(start);
         const e = charIdxToPos(end);
@@ -111,7 +128,7 @@ export default class ProseMirrorEditorDriver {
         self.view.focus();
       },
 
-      // insertText.ts 的回退会调这个；给个 no-op 即可
+      // insertText.ts 回退会调这个；no-op 即可
       dispatchEvent(/* ev */) {
         return true;
       },
@@ -154,7 +171,7 @@ export default class ProseMirrorEditorDriver {
     items.add('richTextKeymap', keymap(richTextKeymap(this.schema)));
     items.add('baseKeymap', keymap(baseKeymap));
     items.add('placeholder', placeholderPlugin(this.attrs.placeholder));
-    items.add('history', history());
+    items.add('history', history()));
     items.add('disabled', disabledPlugin());
     items.add('disableBase64Paste', disableBase64PastePlugin());
     items.add('dropCursor', dropCursor());
@@ -264,7 +281,7 @@ export default class ProseMirrorEditorDriver {
     const editorViewportOffset = this.view.dom.getBoundingClientRect();
     return {
       left: viewportCoords.left - editorViewportOffset.left,
-      top: viewportCoords.top - editorViewportTop,
+      top: viewportCoords.top - editorViewportOffset.top,
     };
   }
 
