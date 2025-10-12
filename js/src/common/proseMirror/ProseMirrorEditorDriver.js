@@ -45,10 +45,10 @@ export default class ProseMirrorEditorDriver {
     const textAll = () =>
       self.view.state.doc.textBetween(0, self.view.state.doc.content.size, TEXT_SEP, TEXT_SEP);
 
-    const posToCharIdx = (pos) =>
+    const posToCharIdxShim = (pos) =>
       self.view.state.doc.textBetween(0, pos, TEXT_SEP, TEXT_SEP).length;
 
-    const charIdxToPos = (idx) => {
+    const charIdxToPosShim = (idx) => {
       // 二分：找最小 pos 使 textBetween(0,pos).length >= idx
       let lo = 0;
       let hi = self.view.state.doc.content.size;
@@ -57,16 +57,23 @@ export default class ProseMirrorEditorDriver {
       while (lo < hi) {
         const mid = (lo + hi) >> 1;
         const len = self.view.state.doc.textBetween(0, mid, TEXT_SEP, TEXT_SEP).length;
-        if (len < idx) lo = mid + 1; else hi = mid;
+        if (len < idx) lo = mid + 1;
+        else hi = mid;
       }
       return lo;
     };
 
     // 供 styleSelectedText / insertText.ts 使用
     this.el = {
-      focus() { self.view.focus(); },
+      // 聚焦
+      focus() {
+        self.view.focus();
+      },
 
-      get value() { return textAll(); },
+      // value：字符串 getter + setter（整篇替换）
+      get value() {
+        return textAll();
+      },
       set value(v) {
         const s = String(v);
         try {
@@ -78,46 +85,67 @@ export default class ProseMirrorEditorDriver {
           });
           self.view.updateState(newState);
         } catch (e) {
-          self.view.dispatch(self.view.state.tr.insertText(s, 0, self.view.state.doc.content.size));
+          self.view.dispatch(
+            self.view.state.tr.insertText(s, 0, self.view.state.doc.content.size)
+          );
         }
         self.view.focus();
       },
 
-      get selectionStart() { return posToCharIdx(self.view.state.selection.from); },
+      // selectionStart/End：字符下标语义（含 setter）
+      get selectionStart() {
+        return posToCharIdxShim(self.view.state.selection.from);
+      },
       set selectionStart(v) {
         const end = this.selectionEnd;
         this.setSelectionRange(Number(v), end);
       },
-      get selectionEnd() { return posToCharIdx(self.view.state.selection.to); },
+      get selectionEnd() {
+        return posToCharIdxShim(self.view.state.selection.to);
+      },
       set selectionEnd(v) {
         const start = this.selectionStart;
         this.setSelectionRange(start, Number(v));
       },
 
+      // setRangeText：把字符区间映射为 PM 位置后替换
       setRangeText(text, start, end /*, mode */) {
-        const s = typeof start === 'number' ? charIdxToPos(start) : charIdxToPos(this.selectionStart);
-        const e = typeof end === 'number' ? charIdxToPos(end) : charIdxToPos(this.selectionEnd);
+        const s =
+          typeof start === 'number' ? charIdxToPosShim(start) : charIdxToPosShim(this.selectionStart);
+        const e =
+          typeof end === 'number' ? charIdxToPosShim(end) : charIdxToPosShim(this.selectionEnd);
         self.view.dispatch(self.view.state.tr.insertText(String(text), s, e));
         self.view.focus();
       },
 
+      // setSelectionRange：字符下标 -> PM 位置
       setSelectionRange(start, end) {
-        const s = charIdxToPos(start), e = charIdxToPos(end);
+        const s = charIdxToPosShim(start);
+        const e = charIdxToPosShim(end);
         const $s = self.view.state.tr.doc.resolve(s);
         const $e = self.view.state.tr.doc.resolve(e);
         self.view.dispatch(self.view.state.tr.setSelection(new TextSelection($s, $e)));
         self.view.focus();
       },
 
-      dispatchEvent() { return true; },
+      // insertText.ts 回退会调这个；no-op 即可
+      dispatchEvent(/* ev */) {
+        return true;
+      },
+
+      // 兼容 insertText.ts 临时设置 contentEditable
       set contentEditable(_v) {},
-      get contentEditable() { return 'false'; },
+      get contentEditable() {
+        return 'false';
+      },
     };
     // =====================================================
 
-    // IME 组合输入状态
+    // IME 组合输入状态（辅助，非必需）
     this._isComposing = false;
     this._compositionEndTs = 0;
+
+    // ✅ 最小修复：不再绑定任何 DOM 事件，统一由 dispatchTransaction 上报
   }
 
   buildEditorStateConfig() {
@@ -152,57 +180,67 @@ export default class ProseMirrorEditorDriver {
   buildEditorProps() {
     const self = this;
 
-    // 仅在 IME 结束的瞬间，用一个小型去重规则兜底（针对全角符号等）
+    // 精确：位置 -> 文本下标
+    const posToCharIdx = (doc, pos) => doc.textBetween(0, pos, '\n', '\n').length;
+
+    // 覆盖所有常见全角范围：
+    // - CJK Symbols and Punctuation: U+3000–U+303F
+    // - Halfwidth and Fullwidth Forms: U+FF00–U+FFEF
     const isFullWidth = (ch) => {
       if (!ch) return false;
       const c = ch.charCodeAt(0);
-      return (c >= 0xFF01 && c <= 0xFF5E) // 全角基本符号
-          || c === 0x3002 || c === 0x3001 || c === 0xFF0C // 。 、 ，
-          || c === 0xFF1A || c === 0xFF1B                  // ： ；
-          || c === 0xFF08 || c === 0xFF09                  // （ ）
-          || c === 0x2014 || c === 0x2026                  // — …
-          || c === 0x2018 || c === 0x2019                  // ‘ ’
-          || c === 0x201C || c === 0x201D;                 // “ ”
+      return (c >= 0x3000 && c <= 0x303F) || (c >= 0xFF00 && c <= 0xFFEF);
     };
+
+    const WINDOW_MS = 180; // 去重时间窗（只影响全角单字符）
+    let lastFW = { idx: -1, ch: '', ts: 0 };
 
     return {
       state: this.state,
 
-      // 监听 IME 组合事件，仅做状态标记
+      // 监听 IME 组合事件（辅助状态）
       handleDOMEvents: {
-        compositionstart: () => { self._isComposing = true; return false; },
-        compositionend:   () => { self._isComposing = false; self._compositionEndTs = Date.now(); return false; },
+        compositionstart: () => {
+          self._isComposing = true;
+          return false;
+        },
+        compositionend: () => {
+          self._isComposing = false;
+          self._compositionEndTs = Date.now();
+          return false;
+        },
       },
 
-      dispatchTransaction(transaction) {
-        const prevState = this.state;
-        const prevDoc = prevState.doc;
-        const prevText = prevDoc.textBetween(0, prevDoc.content.size, '\n', '\n');
+      dispatchTransaction(tr) {
+        // —— 基于 steps 的“全角单字符插入”去重（精确、低侵入） ——
+        if (tr.docChanged) {
+          for (let i = 0; i < tr.steps.length; i++) {
+            const step = tr.steps[i];
+            // ReplaceStep 才有 from/to/slice
+            const from = step.from;
+            const to = step.to;
+            const slice = step.slice;
+            if (from != null && to != null && slice && from === to) {
+              const inserted = slice.content.textBetween(0, slice.content.size, '\n', '\n');
+              if (inserted.length === 1 && isFullWidth(inserted)) {
+                const idx = posToCharIdx(this.state.doc, from);
+                const now = Date.now();
 
-        const candidate = prevState.apply(transaction);
-        const nextDoc = candidate.doc;
-        const nextText = nextDoc.textBetween(0, nextDoc.content.size, '\n', '\n');
-
-        // —— IME 结束瞬间的“全角符号双写”去重：仅在长度+1、且与前一个字符相同的情况下丢弃 ——
-        if (!self._isComposing && Date.now() - self._compositionEndTs <= 200) {
-          if (nextText.length === prevText.length + 1) {
-            // 找到首个差异位置 i
-            let i = 0;
-            const lim = Math.min(prevText.length, nextText.length);
-            while (i < lim && prevText.charCodeAt(i) === nextText.charCodeAt(i)) i++;
-
-            const insertedChar = nextText[i];
-            const prevLeftChar = prevText[i - 1];
-
-            // 典型场景：prev = A！B, next = A！！B  => i 指向第二个“！”
-            if (insertedChar && prevLeftChar && insertedChar === prevLeftChar && isFullWidth(insertedChar)) {
-              return; // 丢弃这次事务（判定为 IME 结束引发的重复插入）
+                // 同位置、同字符、极短时间内的第二次全角插入 => 判定为重复，丢弃
+                if (now - lastFW.ts <= WINDOW_MS && lastFW.idx === idx && lastFW.ch === inserted) {
+                  return;
+                }
+                lastFW = { idx, ch: inserted, ts: now };
+              }
             }
           }
         }
 
-        this.updateState(candidate);
-        const newDocPlaintext = self.serializeContent(nextDoc, self.schema);
+        // —— 正常应用事务并上报 ——
+        const newState = this.state.apply(tr);
+        this.updateState(newState);
+
+        const newDocPlaintext = self.serializeContent(newState.doc, self.schema);
         self.attrs.oninput(newDocPlaintext);
       },
     };
@@ -296,8 +334,12 @@ export default class ProseMirrorEditorDriver {
     };
   }
 
-  focus() { this.view.focus(); }
-  destroy() { this.view.destroy(); }
+  focus() {
+    this.view.focus();
+  }
+  destroy() {
+    this.view.destroy();
+  }
 
   disabled(disabled) {
     this.view.dispatch(this.view.state.tr.setMeta('disabled', disabled));
