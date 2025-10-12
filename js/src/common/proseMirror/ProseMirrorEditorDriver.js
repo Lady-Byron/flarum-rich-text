@@ -149,8 +149,6 @@ export default class ProseMirrorEditorDriver {
     };
 
     target.oninput = callInputListeners;
-    target.onclick = callInputListeners;
-    target.onkeyup = callInputListeners;
   }
 
   buildEditorStateConfig() {
