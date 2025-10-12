@@ -141,14 +141,8 @@ export default class ProseMirrorEditorDriver {
     };
     // =====================================================
 
-    const callInputListeners = (e) => {
-      this.attrs.inputListeners.forEach((listener) => {
-        listener.call(target);
-      });
-      e.redraw = false;
-    };
-
-    target.oninput = callInputListeners;
+    // ✅ 最小修复：不再绑定任何 DOM 事件，统一由 dispatchTransaction 上报
+    // （删除了 callInputListeners / target.oninput / target.onclick / target.onkeyup）
   }
 
   buildEditorStateConfig() {
