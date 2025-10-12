@@ -45,10 +45,10 @@ export default class ProseMirrorEditorDriver {
     const textAll = () =>
       self.view.state.doc.textBetween(0, self.view.state.doc.content.size, TEXT_SEP, TEXT_SEP);
 
-    const posToCharIdxShim = (pos) =>
+    const posToCharIdx = (pos) =>
       self.view.state.doc.textBetween(0, pos, TEXT_SEP, TEXT_SEP).length;
 
-    const charIdxToPosShim = (idx) => {
+    const charIdxToPos = (idx) => {
       // 二分：找最小 pos 使 textBetween(0,pos).length >= idx
       let lo = 0;
       let hi = self.view.state.doc.content.size;
@@ -94,14 +94,14 @@ export default class ProseMirrorEditorDriver {
 
       // selectionStart/End：字符下标语义（含 setter）
       get selectionStart() {
-        return posToCharIdxShim(self.view.state.selection.from);
+        return posToCharIdx(self.view.state.selection.from);
       },
       set selectionStart(v) {
         const end = this.selectionEnd;
         this.setSelectionRange(Number(v), end);
       },
       get selectionEnd() {
-        return posToCharIdxShim(self.view.state.selection.to);
+        return posToCharIdx(self.view.state.selection.to);
       },
       set selectionEnd(v) {
         const start = this.selectionStart;
@@ -111,17 +111,17 @@ export default class ProseMirrorEditorDriver {
       // setRangeText：把字符区间映射为 PM 位置后替换
       setRangeText(text, start, end /*, mode */) {
         const s =
-          typeof start === 'number' ? charIdxToPosShim(start) : charIdxToPosShim(this.selectionStart);
+          typeof start === 'number' ? charIdxToPos(start) : charIdxToPos(this.selectionStart);
         const e =
-          typeof end === 'number' ? charIdxToPosShim(end) : charIdxToPosShim(this.selectionEnd);
+          typeof end === 'number' ? charIdxToPos(end) : charIdxToPos(this.selectionEnd);
         self.view.dispatch(self.view.state.tr.insertText(String(text), s, e));
         self.view.focus();
       },
 
       // setSelectionRange：字符下标 -> PM 位置
       setSelectionRange(start, end) {
-        const s = charIdxToPosShim(start);
-        const e = charIdxToPosShim(end);
+        const s = charIdxToPos(start);
+        const e = charIdxToPos(end);
         const $s = self.view.state.tr.doc.resolve(s);
         const $e = self.view.state.tr.doc.resolve(e);
         self.view.dispatch(self.view.state.tr.setSelection(new TextSelection($s, $e)));
@@ -141,11 +141,9 @@ export default class ProseMirrorEditorDriver {
     };
     // =====================================================
 
-    // IME 组合输入状态（辅助，非必需）
+    // IME 组合输入状态
     this._isComposing = false;
     this._compositionEndTs = 0;
-
-    // ✅ 最小修复：不再绑定任何 DOM 事件，统一由 dispatchTransaction 上报
   }
 
   buildEditorStateConfig() {
@@ -180,25 +178,39 @@ export default class ProseMirrorEditorDriver {
   buildEditorProps() {
     const self = this;
 
-    // 精确：位置 -> 文本下标
-    const posToCharIdx = (doc, pos) => doc.textBetween(0, pos, '\n', '\n').length;
+    // 去重窗口（毫秒）：IME 结束后的极短时间
+    const WINDOW_MS = 250;
 
-    // 覆盖所有常见全角范围：
-    // - CJK Symbols and Punctuation: U+3000–U+303F
-    // - Halfwidth and Fullwidth Forms: U+FF00–U+FFEF
+    // 全角/宽字符判定：覆盖 CJK 标点、全角 ASCII、全角货币及常见宽西文标点
     const isFullWidth = (ch) => {
       if (!ch) return false;
       const c = ch.charCodeAt(0);
-      return (c >= 0x3000 && c <= 0x303F) || (c >= 0xFF00 && c <= 0xFFEF);
+      // 1) CJK 符号与标点 U+3000–U+303F（含【】《》〈〉「」『』、。、· 等）
+      if (c >= 0x3000 && c <= 0x303F) return true;
+      // 2) 全角 ASCII 变体 U+FF01–U+FF60（！＂＃$％＆＇…～）
+      if (c >= 0xFF01 && c <= 0xFF60) return true;
+      // 3) 全角货币等 U+FFE0–U+FFE6（￠￡￢￣￤￥￦）
+      if (c >= 0xFFE0 && c <= 0xFFE6) return true;
+      // 4) 常见宽西文标点
+      if (
+        c === 0x2014 /* — */ ||
+        c === 0x2026 /* … */ ||
+        c === 0x2018 /* ‘ */ ||
+        c === 0x2019 /* ’ */ ||
+        c === 0x201C /* “ */ ||
+        c === 0x201D /* ” */
+      )
+        return true;
+      return false;
     };
 
-    const WINDOW_MS = 180; // 去重时间窗（只影响全角单字符）
-    let lastFW = { idx: -1, ch: '', ts: 0 };
+    // 记录上一条“单字符插入”，用于进一步去重（位置±1 视为相邻重复）
+    let lastInsert = { posCharIdx: -1, ch: '', ts: 0 };
 
     return {
       state: this.state,
 
-      // 监听 IME 组合事件（辅助状态）
+      // 监听 IME 组合事件，仅做状态标记
       handleDOMEvents: {
         compositionstart: () => {
           self._isComposing = true;
@@ -211,36 +223,50 @@ export default class ProseMirrorEditorDriver {
         },
       },
 
-      dispatchTransaction(tr) {
-        // —— 基于 steps 的“全角单字符插入”去重（精确、低侵入） ——
-        if (tr.docChanged) {
-          for (let i = 0; i < tr.steps.length; i++) {
-            const step = tr.steps[i];
-            // ReplaceStep 才有 from/to/slice
-            const from = step.from;
-            const to = step.to;
-            const slice = step.slice;
-            if (from != null && to != null && slice && from === to) {
-              const inserted = slice.content.textBetween(0, slice.content.size, '\n', '\n');
-              if (inserted.length === 1 && isFullWidth(inserted)) {
-                const idx = posToCharIdx(this.state.doc, from);
-                const now = Date.now();
+      dispatchTransaction(transaction) {
+        const prevState = this.state;
+        const prevDoc = prevState.doc;
+        const prevText = prevDoc.textBetween(0, prevDoc.content.size, '\n', '\n');
 
-                // 同位置、同字符、极短时间内的第二次全角插入 => 判定为重复，丢弃
-                if (now - lastFW.ts <= WINDOW_MS && lastFW.idx === idx && lastFW.ch === inserted) {
-                  return;
-                }
-                lastFW = { idx, ch: inserted, ts: now };
-              }
+        const candidate = prevState.apply(transaction);
+        const nextDoc = candidate.doc;
+        const nextText = nextDoc.textBetween(0, nextDoc.content.size, '\n', '\n');
+
+        // —— 仅在 IME 结束后的短窗口内做“全角字符重复单字符插入”去重 ——
+        const now = Date.now();
+        if (!self._isComposing && now - self._compositionEndTs <= WINDOW_MS) {
+          if (nextText.length === prevText.length + 1) {
+            // 找到首个差异位置 i
+            let i = 0;
+            const lim = Math.min(prevText.length, nextText.length);
+            while (i < lim && prevText.charCodeAt(i) === nextText.charCodeAt(i)) i++;
+
+            const insertedChar = nextText[i];
+
+            // 条件A：与上一次插入“字符相同且位置相同或相邻”，并且是全角/宽字符
+            if (
+              isFullWidth(insertedChar) &&
+              lastInsert.ch === insertedChar &&
+              now - lastInsert.ts <= WINDOW_MS &&
+              (i === lastInsert.posCharIdx || i === lastInsert.posCharIdx + 1)
+            ) {
+              return; // 丢弃这次重复插入
             }
+
+            // 记录这次单字符插入（仅长度+1时记录）
+            lastInsert = { posCharIdx: i, ch: insertedChar || '', ts: now };
+          } else {
+            // 其它类型变更重置记录，避免误判
+            lastInsert = { posCharIdx: -1, ch: '', ts: 0 };
           }
+        } else {
+          // 不在窗口内或正在合成：不去重，仅重置单字记录
+          lastInsert = { posCharIdx: -1, ch: '', ts: 0 };
         }
 
-        // —— 正常应用事务并上报 ——
-        const newState = this.state.apply(tr);
-        this.updateState(newState);
-
-        const newDocPlaintext = self.serializeContent(newState.doc, self.schema);
+        // 应用事务并上报
+        this.updateState(candidate);
+        const newDocPlaintext = self.serializeContent(nextDoc, self.schema);
         self.attrs.oninput(newDocPlaintext);
       },
     };
