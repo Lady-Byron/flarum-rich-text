@@ -55,7 +55,8 @@ export default class ProseMirrorEditorDriver {
       while (lo < hi) {
         const mid = (lo + hi) >> 1;
         const len = self.view.state.doc.textBetween(0, mid, TEXT_SEP, TEXT_SEP).length;
-        if (len < idx) lo = mid + 1; else hi = mid;
+        if (len < idx) lo = mid + 1;
+        else hi = mid;
       }
       return lo;
     };
@@ -64,7 +65,6 @@ export default class ProseMirrorEditorDriver {
       focus() {
         self.view.focus();
       },
-
       get value() {
         return textAll();
       },
@@ -79,13 +79,10 @@ export default class ProseMirrorEditorDriver {
           });
           self.view.updateState(newState);
         } catch (e) {
-          self.view.dispatch(
-            self.view.state.tr.insertText(s, 0, self.view.state.doc.content.size)
-          );
+          self.view.dispatch(self.view.state.tr.insertText(s, 0, self.view.state.doc.content.size));
         }
         self.view.focus();
       },
-
       get selectionStart() {
         return posToCharIdx(self.view.state.selection.from);
       },
@@ -100,14 +97,14 @@ export default class ProseMirrorEditorDriver {
         const start = this.selectionStart;
         this.setSelectionRange(start, Number(v));
       },
-
       setRangeText(text, start, end /*, mode */) {
-        const s = typeof start === 'number' ? charIdxToPos(start) : charIdxToPos(this.selectionStart);
-        const e = typeof end === 'number' ? charIdxToPos(end) : charIdxToPos(this.selectionEnd);
+        const s =
+          typeof start === 'number' ? charIdxToPos(start) : charIdxToPos(this.selectionStart);
+        const e =
+          typeof end === 'number' ? charIdxToPos(end) : charIdxToPos(this.selectionEnd);
         self.view.dispatch(self.view.state.tr.insertText(String(text), s, e));
         self.view.focus();
       },
-
       setSelectionRange(start, end) {
         const s = charIdxToPos(start);
         const e = charIdxToPos(end);
@@ -116,11 +113,9 @@ export default class ProseMirrorEditorDriver {
         self.view.dispatch(self.view.state.tr.setSelection(new TextSelection($s, $e)));
         self.view.focus();
       },
-
       dispatchEvent() {
         return true;
       },
-
       set contentEditable(_v) {},
       get contentEditable() {
         return 'false';
@@ -128,8 +123,11 @@ export default class ProseMirrorEditorDriver {
     };
     // =====================================================
 
+    // IME 组合输入状态
     this._isComposing = false;
-    this._compositionEndTs = 0;
+    // 组合期间禁止 oninput，结束后短暂延迟再触发一次
+    this._suppressOnInput = false;
+    this._pendingOnInput = false;
   }
 
   buildEditorStateConfig() {
@@ -164,43 +162,35 @@ export default class ProseMirrorEditorDriver {
   buildEditorProps() {
     const self = this;
 
-    // 是否“在列表中”：只要祖先节点名包含 list / list_item 即视为列表上下文
-    const isInList = (state) => {
-      const {$from} = state.selection;
-      for (let d = $from.depth; d >= 0; d--) {
-        const n = $from.node(d);
-        const name = n.type && n.type.name ? n.type.name : '';
-        if (/list/i.test(name)) return true;
-      }
-      return false;
-    };
-
-    // 全角/宽字符范围
+    // 判定“全角/宽字符”（用于去重）
     const isFullWidth = (ch) => {
       if (!ch) return false;
       const c = ch.charCodeAt(0);
-      if (c >= 0x3000 && c <= 0x303F) return true;    // CJK 符号
-      if (c >= 0xFF01 && c <= 0xFF60) return true;    // 全角 ASCII
-      if (c >= 0xFFE0 && c <= 0xFFE6) return true;    // 全角货币
-      if (c === 0x2014 || c === 0x2026 || c === 0x2018 || c === 0x2019 || c === 0x201C || c === 0x201D) return true; // 宽西文标点
+      if (c >= 0x3000 && c <= 0x303F) return true; // CJK 符号/标点
+      if (c >= 0xFF01 && c <= 0xFF60) return true; // 全角 ASCII 变体
+      if (c >= 0xFFE0 && c <= 0xFFE6) return true; // 全角货币等
+      if (c === 0x2014 || c === 0x2026 || c === 0x2018 || c === 0x2019 || c === 0x201C || c === 0x201D) return true;
       return false;
     };
 
-    // 读取 from 左侧 1 字符（纯文本语义）
+    let lastChar = '';
+    let lastPos = -1;
+    let lastTs = 0;
+
     const charLeftOf = (view, from) => {
       const s = Math.max(0, from - 2);
       const t = view.state.doc.textBetween(s, from, '\n', '\n');
       return t.slice(-1);
     };
 
-    // 事前去重（拼音字母等在合成期的成对重复）
-    let lastChar = '';
-    let lastPos = -1;
-    let lastTs = 0;
     const WINDOW_MS = 250;
 
-    // 事后兜底（合成结束瞬间的全角符号重复）
-    let lastInsert = { posCharIdx: -1, ch: '', ts: 0 };
+    // —— IME 护栏：在组合态禁止上报 oninput，结束后合并上报一次 ——
+    const FLUSH_AFTER_COMPOSITION_MS = 40;
+    const flushOnInput = () => {
+      const newDocPlaintext = self.serializeContent(self.view.state.doc, self.schema);
+      self.attrs.oninput(newDocPlaintext);
+    };
 
     return {
       state: this.state,
@@ -208,89 +198,78 @@ export default class ProseMirrorEditorDriver {
       handleDOMEvents: {
         compositionstart: () => {
           self._isComposing = true;
-          // 清记录，避免跨合成误判
-          lastChar = '';
-          lastPos = -1;
-          lastTs = 0;
+          self._suppressOnInput = true;
+          return false;
+        },
+        compositionupdate: () => {
+          // 组合中不做任何主动处理
           return false;
         },
         compositionend: () => {
           self._isComposing = false;
-          self._compositionEndTs = Date.now();
+          // 给浏览器/PM 一个极短的时间把组合文本落盘，再统一上报
+          setTimeout(() => {
+            self._suppressOnInput = false;
+            if (self._pendingOnInput) {
+              self._pendingOnInput = false;
+              flushOnInput();
+            } else {
+              // 即使没有显式 pending，结束后也再上报一次，确保外层拿到最终值
+              flushOnInput();
+            }
+          }, FLUSH_AFTER_COMPOSITION_MS);
+          return false;
+        },
+        // 个别浏览器会把组合文本当普通 beforeinput 发出，这里直接放行但不触发自定义逻辑
+        beforeinput: (_view, ev) => {
+          const t = ev && ev.inputType;
+          if (t === 'insertCompositionText' || t === 'insertFromComposition' || t === 'deleteCompositionText') {
+            return false; // 不拦截，交给 PM；我们只是不做自定义处理
+          }
           return false;
         },
       },
 
-      // 事前：只在“合成输入 + 列表上下文 + 单字符重复”时拦截第二个
+      // 组合态下：不做“全角去重”干预，避免影响 IME；其余情况保留去重
       handleTextInput(view, from, to, text) {
+        if (self._isComposing) return false; // 关键：让 PM 完全按原生路径处理组合输入
+
         const now = Date.now();
+        if (typeof text === 'string' && text.length === 1 && isFullWidth(text)) {
+          const left = charLeftOf(view, from);
+          const near = from === lastPos || from === lastPos + 1;
+          const fast = now - lastTs <= WINDOW_MS;
 
-        if (self._isComposing && isInList(view.state)) {
-          if (typeof text === 'string' && text.length === 1) {
-            const near = from === lastPos || from === lastPos + 1;
-            const fast = now - lastTs <= WINDOW_MS;
-
-            // 典型现象：拼音字母在列表里被连续插入两次 -> 吞掉第二次
-            if (lastChar === text && near && fast) {
-              lastChar = text;
-              lastPos = from;
-              lastTs = now;
-              return true; // 阻止默认插入
-            }
-
-            // 记录当前字
+          if (left === text && lastChar === text && near && fast) {
             lastChar = text;
             lastPos = from;
             lastTs = now;
-          } else {
-            lastChar = '';
-            lastPos = -1;
-            lastTs = 0;
+            return true; // 吞掉重复
           }
+
+          lastChar = text;
+          lastPos = from;
+          lastTs = now;
+        } else {
+          lastChar = '';
+          lastPos = -1;
+          lastTs = 0;
         }
 
-        return false; // 其它情况交给 PM 处理
+        return false;
       },
 
-      // 事后：对“合成结束短时窗内”的全角/宽字符单字符重复做兜底去重
       dispatchTransaction(transaction) {
-        const prevState = this.state;
-        const prevDoc = prevState.doc;
-        const prevText = prevDoc.textBetween(0, prevDoc.content.size, '\n', '\n');
+        const newState = this.state.apply(transaction);
+        this.updateState(newState);
 
-        const candidate = prevState.apply(transaction);
-        const nextDoc = candidate.doc;
-        const nextText = nextDoc.textBetween(0, nextDoc.content.size, '\n', '\n');
-
-        const now = Date.now();
-        if (!self._isComposing && now - self._compositionEndTs <= WINDOW_MS) {
-          if (nextText.length === prevText.length + 1) {
-            let i = 0;
-            const lim = Math.min(prevText.length, nextText.length);
-            while (i < lim && prevText.charCodeAt(i) === nextText.charCodeAt(i)) i++;
-
-            const insertedChar = nextText[i];
-
-            if (
-              isFullWidth(insertedChar) &&
-              lastInsert.ch === insertedChar &&
-              now - lastInsert.ts <= WINDOW_MS &&
-              (i === lastInsert.posCharIdx || i === lastInsert.posCharIdx + 1)
-            ) {
-              return; // 丢弃这次重复插入
-            }
-
-            lastInsert = { posCharIdx: i, ch: insertedChar || '', ts: now };
-          } else {
-            lastInsert = { posCharIdx: -1, ch: '', ts: 0 };
-          }
-        } else {
-          lastInsert = { posCharIdx: -1, ch: '', ts: 0 };
+        // 组合期间不立刻上报，记一个 pending；结束后统一上报一次
+        if (self._suppressOnInput) {
+          self._pendingOnInput = true;
+          return;
         }
 
-        this.updateState(candidate);
-        const newDocPlaintext = self.serializeContent(this.state.doc, self.schema);
-        self.attrs.oninput(newDocPlaintext);
+        flushOnInput();
       },
     };
   }
