@@ -123,10 +123,35 @@ export default class ProseMirrorEditorDriver {
     };
     // =====================================================
 
-    // IME 组合输入状态
+    // —— 组合态状态，仅用于“延后同步”，不拦事件 ——
     this._isComposing = false;
-    this._suppressOnInput = false;
-    this._pendingOnInput = false;
+
+    // —— 同步节流（合并多次事务）——
+    this._syncScheduled = false;
+    this._scheduleSafeSync = () => {
+      if (this._syncScheduled) return;
+      this._syncScheduled = true;
+
+      const tryFlush = () => {
+        this._syncScheduled = false;
+
+        // 若仍处于组合中，则稍后重试（不阻断编辑，不丢失内容）
+        if (this._isComposing || this.view.composing) {
+          setTimeout(this._scheduleSafeSync, 50);
+          return;
+        }
+
+        const newDocPlaintext = this.serializeContent(this.view.state.doc, this.schema);
+        this.attrs.oninput(newDocPlaintext);
+      };
+
+      // 用 rAF 把所有同帧事务合并为一次上报，避免外层回写打断
+      if (typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(tryFlush);
+      } else {
+        setTimeout(tryFlush, 0);
+      }
+    };
   }
 
   buildEditorStateConfig() {
@@ -147,7 +172,7 @@ export default class ProseMirrorEditorDriver {
     items.add('richTextKeymap', keymap(richTextKeymap(this.schema)));
     items.add('baseKeymap', keymap(baseKeymap));
     items.add('placeholder', placeholderPlugin(this.attrs.placeholder));
-    items.add('history', history());
+    items.add('history', history()));
     items.add('disabled', disabledPlugin());
     items.add('disableBase64Paste', disableBase64PastePlugin());
     items.add('dropCursor', dropCursor());
@@ -161,117 +186,40 @@ export default class ProseMirrorEditorDriver {
   buildEditorProps() {
     const self = this;
 
-    // —— 工具函数 ——
-    const isFullWidth = (ch) => {
-      if (!ch) return false;
-      const c = ch.charCodeAt(0);
-      if (c >= 0x3000 && c <= 0x303F) return true;
-      if (c >= 0xFF01 && c <= 0xFF60) return true;
-      if (c >= 0xFFE0 && c <= 0xFFE6) return true;
-      if (c === 0x2014 || c === 0x2026 || c === 0x2018 || c === 0x2019 || c === 0x201C || c === 0x201D) return true;
-      return false;
-    };
-
-    // 识别 ASCII（拼音/英数撇号与空格）
-    const isAsciiLettersDigits = (t) => typeof t === 'string' && /^[\x20-\x7E']+$/.test(t) && /[A-Za-z0-9']/.test(t);
-
-    const inList = (state) => {
-      const $pos = state.selection.$from;
-      for (let d = $pos.depth; d >= 0; d--) {
-        const n = $pos.node(d);
-        const name = n && n.type && n.type.name;
-        if (name === 'list_item' || name === 'bullet_list' || name === 'ordered_list') return true;
-      }
-      return false;
-    };
-
-    let lastChar = '';
-    let lastPos = -1;
-    let lastTs = 0;
-
-    const charLeftOf = (view, from) => {
-      const s = Math.max(0, from - 2);
-      const t = view.state.doc.textBetween(s, from, '\n', '\n');
-      return t.slice(-1);
-    };
-
-    const WINDOW_MS = 250;
-
-    const FLUSH_AFTER_COMPOSITION_MS = 40;
-    const flushOnInput = () => {
-      const newDocPlaintext = self.serializeContent(self.view.state.doc, self.schema);
-      self.attrs.oninput(newDocPlaintext);
-    };
-
     return {
       state: this.state,
 
+      // 只记录组合态，绝不拦截
       handleDOMEvents: {
         compositionstart: () => {
           self._isComposing = true;
-          self._suppressOnInput = true;
           return false;
         },
         compositionupdate: () => false,
         compositionend: () => {
           self._isComposing = false;
-          setTimeout(() => {
-            self._suppressOnInput = false;
-            const need = self._pendingOnInput;
-            self._pendingOnInput = false;
-            flushOnInput();
-            if (need) ;
-          }, FLUSH_AFTER_COMPOSITION_MS);
+          // 组合立刻安排一次同步，确保外层拿到最终值
+          self._scheduleSafeSync();
           return false;
         },
-        // 仅当有 data 且能明确判定为 ASCII（拼音）时拦截；不再因 inputType === 'insertText' 而一刀切
-        beforeinput: (_view, ev) => {
-          try {
-            if (!ev) return false;
-            const composing = ev.isComposing === true;
-            const data = typeof ev.data === 'string' ? ev.data : '';
-            if (composing && inList(self.view.state) && data && isAsciiLettersDigits(data)) {
-              ev.preventDefault(); // 拼音不上屏
-              return true;
-            }
-          } catch (e) {}
+        blur: () => {
+          // 失焦也强制同步一次，兜底
+          self._isComposing = false;
+          self._scheduleSafeSync();
           return false;
         },
       },
 
-      // 组合态 + 列表环境 + ASCII：兜底拦截（有些环境不会走 beforeinput）
-      handleTextInput(view, from, to, text) {
-        if (self._isComposing && inList(view.state) && isAsciiLettersDigits(text)) {
-          return true;
-        }
-
-        // 非组合态：保留全角重复去重
-        const now = Date.now();
-        if (typeof text === 'string' && text.length === 1 && isFullWidth(text)) {
-          const left = charLeftOf(view, from);
-          const near = from === lastPos || from === lastPos + 1;
-          const fast = now - lastTs <= WINDOW_MS;
-          if (left === text && lastChar === text && near && fast) {
-            lastChar = text; lastPos = from; lastTs = now;
-            return true;
-          }
-          lastChar = text; lastPos = from; lastTs = now;
-        } else {
-          lastChar = ''; lastPos = -1; lastTs = 0;
-        }
-
-        return false;
-      },
+      // 不做任何自定义文本处理，全部交给 PM（IME 可靠）
+      // handleTextInput: 不实现
+      // beforeinput: 不实现
 
       dispatchTransaction(transaction) {
         const newState = this.state.apply(transaction);
         this.updateState(newState);
 
-        if (self._suppressOnInput) {
-          self._pendingOnInput = true;
-          return;
-        }
-        flushOnInput();
+        // 每个事务合并为一次安全同步（组合态会自动延后）
+        self._scheduleSafeSync();
       },
     };
   }
