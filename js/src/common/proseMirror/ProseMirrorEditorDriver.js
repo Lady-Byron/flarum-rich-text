@@ -97,7 +97,7 @@ export default class ProseMirrorEditorDriver {
         const start = this.selectionStart;
         this.setSelectionRange(start, Number(v));
       },
-      setRangeText(text, start, end /*, mode */) {
+      setRangeText(text, start, end) {
         const s =
           typeof start === 'number' ? charIdxToPos(start) : charIdxToPos(this.selectionStart);
         const e =
@@ -125,7 +125,6 @@ export default class ProseMirrorEditorDriver {
 
     // IME 组合输入状态
     this._isComposing = false;
-    // 组合期间禁止 oninput，结束后短暂延迟再触发一次
     this._suppressOnInput = false;
     this._pendingOnInput = false;
   }
@@ -162,14 +161,28 @@ export default class ProseMirrorEditorDriver {
   buildEditorProps() {
     const self = this;
 
-    // 判定“全角/宽字符”（用于去重）
+    // —— 工具函数 ——
     const isFullWidth = (ch) => {
       if (!ch) return false;
       const c = ch.charCodeAt(0);
-      if (c >= 0x3000 && c <= 0x303F) return true; // CJK 符号/标点
-      if (c >= 0xFF01 && c <= 0xFF60) return true; // 全角 ASCII 变体
-      if (c >= 0xFFE0 && c <= 0xFFE6) return true; // 全角货币等
+      if (c >= 0x3000 && c <= 0x303F) return true;
+      if (c >= 0xFF01 && c <= 0xFF60) return true;
+      if (c >= 0xFFE0 && c <= 0xFFE6) return true;
       if (c === 0x2014 || c === 0x2026 || c === 0x2018 || c === 0x2019 || c === 0x201C || c === 0x201D) return true;
+      return false;
+    };
+
+    // 仅 ASCII（用于识别拼音/英文片段）
+    const isAsciiLettersDigits = (t) => typeof t === 'string' && /^[a-zA-Z0-9' ]+$/.test(t);
+
+    // 是否处在列表项中（bullet/ordered）
+    const inList = (state) => {
+      const $pos = state.selection.$from;
+      for (let d = $pos.depth; d >= 0; d--) {
+        const n = $pos.node(d);
+        const name = n && n.type && n.type.name;
+        if (name === 'list_item' || name === 'bullet_list' || name === 'ordered_list') return true;
+      }
       return false;
     };
 
@@ -185,7 +198,6 @@ export default class ProseMirrorEditorDriver {
 
     const WINDOW_MS = 250;
 
-    // —— IME 护栏：在组合态禁止上报 oninput，结束后合并上报一次 ——
     const FLUSH_AFTER_COMPOSITION_MS = 40;
     const flushOnInput = () => {
       const newDocPlaintext = self.serializeContent(self.view.state.doc, self.schema);
@@ -201,59 +213,59 @@ export default class ProseMirrorEditorDriver {
           self._suppressOnInput = true;
           return false;
         },
-        compositionupdate: () => {
-          // 组合中不做任何主动处理
-          return false;
-        },
+        compositionupdate: () => false,
         compositionend: () => {
           self._isComposing = false;
-          // 给浏览器/PM 一个极短的时间把组合文本落盘，再统一上报
           setTimeout(() => {
             self._suppressOnInput = false;
-            if (self._pendingOnInput) {
-              self._pendingOnInput = false;
-              flushOnInput();
-            } else {
-              // 即使没有显式 pending，结束后也再上报一次，确保外层拿到最终值
-              flushOnInput();
-            }
+            const need = self._pendingOnInput;
+            self._pendingOnInput = false;
+            flushOnInput();
+            if (need) ; // 已合并
           }, FLUSH_AFTER_COMPOSITION_MS);
           return false;
         },
-        // 个别浏览器会把组合文本当普通 beforeinput 发出，这里直接放行但不触发自定义逻辑
+        // 关键：在列表环境 + 组合态时，拦截 ASCII（拼音）片段，避免写进文档
         beforeinput: (_view, ev) => {
-          const t = ev && ev.inputType;
-          if (t === 'insertCompositionText' || t === 'insertFromComposition' || t === 'deleteCompositionText') {
-            return false; // 不拦截，交给 PM；我们只是不做自定义处理
-          }
+          try {
+            if (!ev) return false;
+            const composing = ev.isComposing === true;
+            const data = typeof ev.data === 'string' ? ev.data : '';
+            const type = ev.inputType || '';
+            if (
+              composing &&
+              inList(self.view.state) &&
+              (isAsciiLettersDigits(data) || type === 'insertText') // 某些浏览器 data 为空
+            ) {
+              // 允许最终中文在 compositionend 落盘；此处只拦拼音
+              ev.preventDefault();
+              return true;
+            }
+          } catch (e) {}
           return false;
         },
       },
 
-      // 组合态下：不做“全角去重”干预，避免影响 IME；其余情况保留去重
+      // 组合中在列表里出现的 ASCII 文本（拼音）也从这里兜底拦截
       handleTextInput(view, from, to, text) {
-        if (self._isComposing) return false; // 关键：让 PM 完全按原生路径处理组合输入
+        // 1) 组合态 + 列表环境 + ASCII：吞掉（拼音不入文档）
+        if (self._isComposing && inList(view.state) && isAsciiLettersDigits(text)) {
+          return true;
+        }
 
+        // 2) 非组合态：保留“全角重复去重”以修复部分浏览器的重复上屏
         const now = Date.now();
         if (typeof text === 'string' && text.length === 1 && isFullWidth(text)) {
           const left = charLeftOf(view, from);
           const near = from === lastPos || from === lastPos + 1;
           const fast = now - lastTs <= WINDOW_MS;
-
           if (left === text && lastChar === text && near && fast) {
-            lastChar = text;
-            lastPos = from;
-            lastTs = now;
-            return true; // 吞掉重复
+            lastChar = text; lastPos = from; lastTs = now;
+            return true;
           }
-
-          lastChar = text;
-          lastPos = from;
-          lastTs = now;
+          lastChar = text; lastPos = from; lastTs = now;
         } else {
-          lastChar = '';
-          lastPos = -1;
-          lastTs = 0;
+          lastChar = ''; lastPos = -1; lastTs = 0;
         }
 
         return false;
@@ -263,12 +275,10 @@ export default class ProseMirrorEditorDriver {
         const newState = this.state.apply(transaction);
         this.updateState(newState);
 
-        // 组合期间不立刻上报，记一个 pending；结束后统一上报一次
         if (self._suppressOnInput) {
           self._pendingOnInput = true;
           return;
         }
-
         flushOnInput();
       },
     };
