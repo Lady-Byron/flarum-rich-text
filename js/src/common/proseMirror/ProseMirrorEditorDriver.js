@@ -142,7 +142,6 @@ export default class ProseMirrorEditorDriver {
     // =====================================================
 
     // ✅ 最小修复：不再绑定任何 DOM 事件，统一由 dispatchTransaction 上报
-    // （删除了 callInputListeners / target.oninput / target.onclick / target.onkeyup）
   }
 
   buildEditorStateConfig() {
@@ -176,14 +175,49 @@ export default class ProseMirrorEditorDriver {
 
   buildEditorProps() {
     const self = this;
+
+    // 记录“上一次单字符插入”的位置与字符，用于去重（同帧/瞬时二次相同插入）
+    let lastInsert = { posCharIdx: -1, ch: '', ts: 0 };
+
     return {
       state: this.state,
       dispatchTransaction(transaction) {
-        const newState = this.state.apply(transaction);
-        this.updateState(newState);
+        const prevState = this.state;
+        const prevDoc = prevState.doc;
+        const prevText = prevDoc.textBetween(0, prevDoc.content.size, '\n', '\n');
 
-        const newDoc = this.state.doc;
-        const newDocPlaintext = self.serializeContent(newDoc, self.schema);
+        const candidate = prevState.apply(transaction);
+        const nextDoc = candidate.doc;
+        const nextText = nextDoc.textBetween(0, nextDoc.content.size, '\n', '\n');
+
+        // 只在“长度+1”的情况检测是否为重复单字符插入
+        if (nextText.length === prevText.length + 1) {
+          // 找到首次差异点
+          let i = 0;
+          const lim = prevText.length;
+          while (i < lim && prevText.charCodeAt(i) === nextText.charCodeAt(i)) i++;
+          const insertedChar = nextText[i];
+          const now = Date.now();
+
+          // 若在极短时间内，且同一字符、同一字符下标再次出现 → 视为重复插入，丢弃这次事务
+          if (
+            now - lastInsert.ts < 100 &&
+            lastInsert.posCharIdx === i &&
+            lastInsert.ch === insertedChar
+          ) {
+            return; // 丢弃重复的“第二次”插入
+          }
+
+          // 记录这次插入
+          lastInsert = { posCharIdx: i, ch: insertedChar, ts: now };
+        } else {
+          // 其它变更重置记录，避免误判
+          lastInsert = { posCharIdx: -1, ch: '', ts: 0 };
+        }
+
+        // 应用事务并上报
+        this.updateState(candidate);
+        const newDocPlaintext = self.serializeContent(nextDoc, self.schema);
         self.attrs.oninput(newDocPlaintext);
       },
     };
