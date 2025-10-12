@@ -40,7 +40,6 @@ export default class ProseMirrorEditorDriver {
     // ===== textarea 兼容层（完全模拟字符串下标语义）=====
     const self = this;
 
-    // PM 位置 <-> 纯文本字符下标 映射
     const TEXT_SEP = '\n';
     const textAll = () =>
       self.view.state.doc.textBetween(0, self.view.state.doc.content.size, TEXT_SEP, TEXT_SEP);
@@ -49,7 +48,6 @@ export default class ProseMirrorEditorDriver {
       self.view.state.doc.textBetween(0, pos, TEXT_SEP, TEXT_SEP).length;
 
     const charIdxToPos = (idx) => {
-      // 二分：找最小 pos 使 textBetween(0,pos).length >= idx
       let lo = 0;
       let hi = self.view.state.doc.content.size;
       const total = textAll().length;
@@ -57,20 +55,16 @@ export default class ProseMirrorEditorDriver {
       while (lo < hi) {
         const mid = (lo + hi) >> 1;
         const len = self.view.state.doc.textBetween(0, mid, TEXT_SEP, TEXT_SEP).length;
-        if (len < idx) lo = mid + 1;
-        else hi = mid;
+        if (len < idx) lo = mid + 1; else hi = mid;
       }
       return lo;
     };
 
-    // 供 styleSelectedText / insertText.ts 使用
     this.el = {
-      // 聚焦
       focus() {
         self.view.focus();
       },
 
-      // value：字符串 getter + setter（整篇替换）
       get value() {
         return textAll();
       },
@@ -92,7 +86,6 @@ export default class ProseMirrorEditorDriver {
         self.view.focus();
       },
 
-      // selectionStart/End：字符下标语义（含 setter）
       get selectionStart() {
         return posToCharIdx(self.view.state.selection.from);
       },
@@ -108,17 +101,13 @@ export default class ProseMirrorEditorDriver {
         this.setSelectionRange(start, Number(v));
       },
 
-      // setRangeText：把字符区间映射为 PM 位置后替换
       setRangeText(text, start, end /*, mode */) {
-        const s =
-          typeof start === 'number' ? charIdxToPos(start) : charIdxToPos(this.selectionStart);
-        const e =
-          typeof end === 'number' ? charIdxToPos(end) : charIdxToPos(this.selectionEnd);
+        const s = typeof start === 'number' ? charIdxToPos(start) : charIdxToPos(this.selectionStart);
+        const e = typeof end === 'number' ? charIdxToPos(end) : charIdxToPos(this.selectionEnd);
         self.view.dispatch(self.view.state.tr.insertText(String(text), s, e));
         self.view.focus();
       },
 
-      // setSelectionRange：字符下标 -> PM 位置
       setSelectionRange(start, end) {
         const s = charIdxToPos(start);
         const e = charIdxToPos(end);
@@ -128,12 +117,10 @@ export default class ProseMirrorEditorDriver {
         self.view.focus();
       },
 
-      // insertText.ts 回退会调这个；no-op 即可
-      dispatchEvent(/* ev */) {
+      dispatchEvent() {
         return true;
       },
 
-      // 兼容 insertText.ts 临时设置 contentEditable
       set contentEditable(_v) {},
       get contentEditable() {
         return 'false';
@@ -141,7 +128,6 @@ export default class ProseMirrorEditorDriver {
     };
     // =====================================================
 
-    // IME 组合输入状态（可用于统计/调试）
     this._isComposing = false;
     this._compositionEndTs = 0;
   }
@@ -178,51 +164,54 @@ export default class ProseMirrorEditorDriver {
   buildEditorProps() {
     const self = this;
 
-    // 针对“所有全角/宽字符”的判定
-    const isFullWidth = (ch) => {
-      if (!ch) return false;
-      const c = ch.charCodeAt(0);
-      // 1) CJK 符号与标点 U+3000–U+303F（含【】《》〈〉「」『』、。、· 等）
-      if (c >= 0x3000 && c <= 0x303F) return true;
-      // 2) 全角 ASCII 变体 U+FF01–U+FF60（！＂＃$％＆＇…～）
-      if (c >= 0xFF01 && c <= 0xFF60) return true;
-      // 3) 全角货币等 U+FFE0–U+FFE6（￠￡￢￣￤￥￦）
-      if (c >= 0xFFE0 && c <= 0xFFE6) return true;
-      // 4) 常见“宽”西文标点（中文环境等宽）
-      if (
-        c === 0x2014 /* — */ ||
-        c === 0x2026 /* … */ ||
-        c === 0x2018 /* ‘ */ ||
-        c === 0x2019 /* ’ */ ||
-        c === 0x201C /* “ */ ||
-        c === 0x201D /* ” */
-      )
-        return true;
+    // 是否“在列表中”：只要祖先节点名包含 list / list_item 即视为列表上下文
+    const isInList = (state) => {
+      const {$from} = state.selection;
+      for (let d = $from.depth; d >= 0; d--) {
+        const n = $from.node(d);
+        const name = n.type && n.type.name ? n.type.name : '';
+        if (/list/i.test(name)) return true;
+      }
       return false;
     };
 
-    // 最近一次“文本输入”的记录
-    let lastChar = '';
-    let lastPos = -1;
-    let lastTs = 0;
+    // 全角/宽字符范围
+    const isFullWidth = (ch) => {
+      if (!ch) return false;
+      const c = ch.charCodeAt(0);
+      if (c >= 0x3000 && c <= 0x303F) return true;    // CJK 符号
+      if (c >= 0xFF01 && c <= 0xFF60) return true;    // 全角 ASCII
+      if (c >= 0xFFE0 && c <= 0xFFE6) return true;    // 全角货币
+      if (c === 0x2014 || c === 0x2026 || c === 0x2018 || c === 0x2019 || c === 0x201C || c === 0x201D) return true; // 宽西文标点
+      return false;
+    };
 
-    // 获取 from 左侧 1 个字符（按纯文本语义）
+    // 读取 from 左侧 1 字符（纯文本语义）
     const charLeftOf = (view, from) => {
       const s = Math.max(0, from - 2);
       const t = view.state.doc.textBetween(s, from, '\n', '\n');
       return t.slice(-1);
     };
 
-    // 去重时窗（毫秒）：避免误伤连续快速真输入
+    // 事前去重（拼音字母等在合成期的成对重复）
+    let lastChar = '';
+    let lastPos = -1;
+    let lastTs = 0;
     const WINDOW_MS = 250;
+
+    // 事后兜底（合成结束瞬间的全角符号重复）
+    let lastInsert = { posCharIdx: -1, ch: '', ts: 0 };
 
     return {
       state: this.state,
 
-      // 监听 IME 组合事件（可选，仅状态记录）
       handleDOMEvents: {
         compositionstart: () => {
           self._isComposing = true;
+          // 清记录，避免跨合成误判
+          lastChar = '';
+          lastPos = -1;
+          lastTs = 0;
           return false;
         },
         compositionend: () => {
@@ -232,46 +221,74 @@ export default class ProseMirrorEditorDriver {
         },
       },
 
-      // 事前拦截：在真正改文档前，对“全角/宽字符”的第二次相邻重复直接吞掉
+      // 事前：只在“合成输入 + 列表上下文 + 单字符重复”时拦截第二个
       handleTextInput(view, from, to, text) {
-
         const now = Date.now();
 
-        // 只处理“单字符插入 + 全角/宽字符”
-        if (typeof text === 'string' && text.length === 1 && isFullWidth(text)) {
-          const left = charLeftOf(view, from);
+        if (self._isComposing && isInList(view.state)) {
+          if (typeof text === 'string' && text.length === 1) {
+            const near = from === lastPos || from === lastPos + 1;
+            const fast = now - lastTs <= WINDOW_MS;
 
-          const near = from === lastPos || from === lastPos + 1; // 相同或相邻位置
-          const fast = now - lastTs <= WINDOW_MS;                // 短时窗
+            // 典型现象：拼音字母在列表里被连续插入两次 -> 吞掉第二次
+            if (lastChar === text && near && fast) {
+              lastChar = text;
+              lastPos = from;
+              lastTs = now;
+              return true; // 阻止默认插入
+            }
 
-          // 左侧字符与本次相同，且与上次插入的字符相同，并且位置相同/相邻且时间很近
-          if (left === text && lastChar === text && near && fast) {
-            // 吞掉这次“重复插入”
+            // 记录当前字
             lastChar = text;
             lastPos = from;
             lastTs = now;
-            return true; // 已处理，阻止默认插入
+          } else {
+            lastChar = '';
+            lastPos = -1;
+            lastTs = 0;
           }
-
-          // 记录这次
-          lastChar = text;
-          lastPos = from;
-          lastTs = now;
-        } else {
-          // 其它情况重置，避免误判
-          lastChar = '';
-          lastPos = -1;
-          lastTs = 0;
         }
 
-        return false; // 交由 PM 默认处理
+        return false; // 其它情况交给 PM 处理
       },
 
-      // 统一在事务层上报内容（替代早期的 DOM oninput/onkeyup）
+      // 事后：对“合成结束短时窗内”的全角/宽字符单字符重复做兜底去重
       dispatchTransaction(transaction) {
-        const newState = this.state.apply(transaction);
-        this.updateState(newState);
+        const prevState = this.state;
+        const prevDoc = prevState.doc;
+        const prevText = prevDoc.textBetween(0, prevDoc.content.size, '\n', '\n');
 
+        const candidate = prevState.apply(transaction);
+        const nextDoc = candidate.doc;
+        const nextText = nextDoc.textBetween(0, nextDoc.content.size, '\n', '\n');
+
+        const now = Date.now();
+        if (!self._isComposing && now - self._compositionEndTs <= WINDOW_MS) {
+          if (nextText.length === prevText.length + 1) {
+            let i = 0;
+            const lim = Math.min(prevText.length, nextText.length);
+            while (i < lim && prevText.charCodeAt(i) === nextText.charCodeAt(i)) i++;
+
+            const insertedChar = nextText[i];
+
+            if (
+              isFullWidth(insertedChar) &&
+              lastInsert.ch === insertedChar &&
+              now - lastInsert.ts <= WINDOW_MS &&
+              (i === lastInsert.posCharIdx || i === lastInsert.posCharIdx + 1)
+            ) {
+              return; // 丢弃这次重复插入
+            }
+
+            lastInsert = { posCharIdx: i, ch: insertedChar || '', ts: now };
+          } else {
+            lastInsert = { posCharIdx: -1, ch: '', ts: 0 };
+          }
+        } else {
+          lastInsert = { posCharIdx: -1, ch: '', ts: 0 };
+        }
+
+        this.updateState(candidate);
         const newDocPlaintext = self.serializeContent(this.state.doc, self.schema);
         self.attrs.oninput(newDocPlaintext);
       },
