@@ -172,10 +172,9 @@ export default class ProseMirrorEditorDriver {
       return false;
     };
 
-    // 仅 ASCII（用于识别拼音/英文片段）
-    const isAsciiLettersDigits = (t) => typeof t === 'string' && /^[a-zA-Z0-9' ]+$/.test(t);
+    // 识别 ASCII（拼音/英数撇号与空格）
+    const isAsciiLettersDigits = (t) => typeof t === 'string' && /^[\x20-\x7E']+$/.test(t) && /[A-Za-z0-9']/.test(t);
 
-    // 是否处在列表项中（bullet/ordered）
     const inList = (state) => {
       const $pos = state.selection.$from;
       for (let d = $pos.depth; d >= 0; d--) {
@@ -221,24 +220,18 @@ export default class ProseMirrorEditorDriver {
             const need = self._pendingOnInput;
             self._pendingOnInput = false;
             flushOnInput();
-            if (need) ; // 已合并
+            if (need) ;
           }, FLUSH_AFTER_COMPOSITION_MS);
           return false;
         },
-        // 关键：在列表环境 + 组合态时，拦截 ASCII（拼音）片段，避免写进文档
+        // 仅当有 data 且能明确判定为 ASCII（拼音）时拦截；不再因 inputType === 'insertText' 而一刀切
         beforeinput: (_view, ev) => {
           try {
             if (!ev) return false;
             const composing = ev.isComposing === true;
             const data = typeof ev.data === 'string' ? ev.data : '';
-            const type = ev.inputType || '';
-            if (
-              composing &&
-              inList(self.view.state) &&
-              (isAsciiLettersDigits(data) || type === 'insertText') // 某些浏览器 data 为空
-            ) {
-              // 允许最终中文在 compositionend 落盘；此处只拦拼音
-              ev.preventDefault();
+            if (composing && inList(self.view.state) && data && isAsciiLettersDigits(data)) {
+              ev.preventDefault(); // 拼音不上屏
               return true;
             }
           } catch (e) {}
@@ -246,14 +239,13 @@ export default class ProseMirrorEditorDriver {
         },
       },
 
-      // 组合中在列表里出现的 ASCII 文本（拼音）也从这里兜底拦截
+      // 组合态 + 列表环境 + ASCII：兜底拦截（有些环境不会走 beforeinput）
       handleTextInput(view, from, to, text) {
-        // 1) 组合态 + 列表环境 + ASCII：吞掉（拼音不入文档）
         if (self._isComposing && inList(view.state) && isAsciiLettersDigits(text)) {
           return true;
         }
 
-        // 2) 非组合态：保留“全角重复去重”以修复部分浏览器的重复上屏
+        // 非组合态：保留全角重复去重
         const now = Date.now();
         if (typeof text === 'string' && text.length === 1 && isFullWidth(text)) {
           const left = charLeftOf(view, from);
