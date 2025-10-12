@@ -141,7 +141,7 @@ export default class ProseMirrorEditorDriver {
     };
     // =====================================================
 
-    // IME 组合输入状态
+    // IME 组合输入状态（可用于统计/调试）
     this._isComposing = false;
     this._compositionEndTs = 0;
   }
@@ -178,10 +178,7 @@ export default class ProseMirrorEditorDriver {
   buildEditorProps() {
     const self = this;
 
-    // 去重窗口（毫秒）：IME 结束后的极短时间
-    const WINDOW_MS = 250;
-
-    // 全角/宽字符判定：覆盖 CJK 标点、全角 ASCII、全角货币及常见宽西文标点
+    // 针对“所有全角/宽字符”的判定
     const isFullWidth = (ch) => {
       if (!ch) return false;
       const c = ch.charCodeAt(0);
@@ -191,7 +188,7 @@ export default class ProseMirrorEditorDriver {
       if (c >= 0xFF01 && c <= 0xFF60) return true;
       // 3) 全角货币等 U+FFE0–U+FFE6（￠￡￢￣￤￥￦）
       if (c >= 0xFFE0 && c <= 0xFFE6) return true;
-      // 4) 常见宽西文标点
+      // 4) 常见“宽”西文标点（中文环境等宽）
       if (
         c === 0x2014 /* — */ ||
         c === 0x2026 /* … */ ||
@@ -204,13 +201,25 @@ export default class ProseMirrorEditorDriver {
       return false;
     };
 
-    // 记录上一条“单字符插入”，用于进一步去重（位置±1 视为相邻重复）
-    let lastInsert = { posCharIdx: -1, ch: '', ts: 0 };
+    // 最近一次“文本输入”的记录
+    let lastChar = '';
+    let lastPos = -1;
+    let lastTs = 0;
+
+    // 获取 from 左侧 1 个字符（按纯文本语义）
+    const charLeftOf = (view, from) => {
+      const s = Math.max(0, from - 2);
+      const t = view.state.doc.textBetween(s, from, '\n', '\n');
+      return t.slice(-1);
+    };
+
+    // 去重时窗（毫秒）：避免误伤连续快速真输入
+    const WINDOW_MS = 250;
 
     return {
       state: this.state,
 
-      // 监听 IME 组合事件，仅做状态标记
+      // 监听 IME 组合事件（可选，仅状态记录）
       handleDOMEvents: {
         compositionstart: () => {
           self._isComposing = true;
@@ -223,50 +232,46 @@ export default class ProseMirrorEditorDriver {
         },
       },
 
-      dispatchTransaction(transaction) {
-        const prevState = this.state;
-        const prevDoc = prevState.doc;
-        const prevText = prevDoc.textBetween(0, prevDoc.content.size, '\n', '\n');
-
-        const candidate = prevState.apply(transaction);
-        const nextDoc = candidate.doc;
-        const nextText = nextDoc.textBetween(0, nextDoc.content.size, '\n', '\n');
-
-        // —— 仅在 IME 结束后的短窗口内做“全角字符重复单字符插入”去重 ——
+      // 事前拦截：在真正改文档前，对“全角/宽字符”的第二次相邻重复直接吞掉
+      handleTextInput(view, from, to, text) {
         const now = Date.now();
-        if (!self._isComposing && now - self._compositionEndTs <= WINDOW_MS) {
-          if (nextText.length === prevText.length + 1) {
-            // 找到首个差异位置 i
-            let i = 0;
-            const lim = Math.min(prevText.length, nextText.length);
-            while (i < lim && prevText.charCodeAt(i) === nextText.charCodeAt(i)) i++;
 
-            const insertedChar = nextText[i];
+        // 只处理“单字符插入 + 全角/宽字符”
+        if (typeof text === 'string' && text.length === 1 && isFullWidth(text)) {
+          const left = charLeftOf(view, from);
 
-            // 条件A：与上一次插入“字符相同且位置相同或相邻”，并且是全角/宽字符
-            if (
-              isFullWidth(insertedChar) &&
-              lastInsert.ch === insertedChar &&
-              now - lastInsert.ts <= WINDOW_MS &&
-              (i === lastInsert.posCharIdx || i === lastInsert.posCharIdx + 1)
-            ) {
-              return; // 丢弃这次重复插入
-            }
+          const near = from === lastPos || from === lastPos + 1; // 相同或相邻位置
+          const fast = now - lastTs <= WINDOW_MS;                // 短时窗
 
-            // 记录这次单字符插入（仅长度+1时记录）
-            lastInsert = { posCharIdx: i, ch: insertedChar || '', ts: now };
-          } else {
-            // 其它类型变更重置记录，避免误判
-            lastInsert = { posCharIdx: -1, ch: '', ts: 0 };
+          // 左侧字符与本次相同，且与上次插入的字符相同，并且位置相同/相邻且时间很近
+          if (left === text && lastChar === text && near && fast) {
+            // 吞掉这次“重复插入”
+            lastChar = text;
+            lastPos = from;
+            lastTs = now;
+            return true; // 已处理，阻止默认插入
           }
+
+          // 记录这次
+          lastChar = text;
+          lastPos = from;
+          lastTs = now;
         } else {
-          // 不在窗口内或正在合成：不去重，仅重置单字记录
-          lastInsert = { posCharIdx: -1, ch: '', ts: 0 };
+          // 其它情况重置，避免误判
+          lastChar = '';
+          lastPos = -1;
+          lastTs = 0;
         }
 
-        // 应用事务并上报
-        this.updateState(candidate);
-        const newDocPlaintext = self.serializeContent(nextDoc, self.schema);
+        return false; // 交由 PM 默认处理
+      },
+
+      // 统一在事务层上报内容（替代早期的 DOM oninput/onkeyup）
+      dispatchTransaction(transaction) {
+        const newState = this.state.apply(transaction);
+        this.updateState(newState);
+
+        const newDocPlaintext = self.serializeContent(this.state.doc, self.schema);
         self.attrs.oninput(newDocPlaintext);
       },
     };
