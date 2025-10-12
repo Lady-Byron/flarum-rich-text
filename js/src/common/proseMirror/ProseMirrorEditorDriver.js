@@ -234,6 +234,8 @@ export default class ProseMirrorEditorDriver {
 
       // 事前拦截：在真正改文档前，对“全角/宽字符”的第二次相邻重复直接吞掉
       handleTextInput(view, from, to, text) {
+        if (self._isComposing) return true;
+
         const now = Date.now();
 
         // 只处理“单字符插入 + 全角/宽字符”
