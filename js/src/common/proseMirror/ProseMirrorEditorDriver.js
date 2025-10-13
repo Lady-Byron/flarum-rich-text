@@ -18,6 +18,7 @@ import MarkdownSerializerBuilder from './markdown/MarkdownSerializerBuilder';
 import MarkdownParserBuilder from './markdown/MarkdownParserBuilder';
 import SchemaBuilder from './markdown/SchemaBuilder';
 import { inputRules } from 'prosemirror-inputrules';
+import lbMoreFormatPreview from './plugins/lbMoreFormatPreview';
 
 export default class ProseMirrorEditorDriver {
   constructor(target, attrs) {
@@ -178,6 +179,7 @@ export default class ProseMirrorEditorDriver {
     items.add('gapCursor', gapCursor());
     items.add('menu', menuPlugin(this.attrs.menuState));
     items.add('toggleSpoiler', toggleSpoiler(this.schema));
+    items.add('lbMoreFormatPreview', lbMoreFormatPreview());
 
     return items;
   }
