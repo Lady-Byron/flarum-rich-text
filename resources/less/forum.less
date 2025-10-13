@@ -207,8 +207,19 @@ li.ProseMirror-selectednode:after {
 }
 
 
-/* 标签本体在编辑区隐藏（或弱化显示请改成 opacity:.35） */
-.lbmf-tag-hidden { display: none; }
+/* 替换 .lbmf-tag-hidden { display:none } */
+.lbmf-tag-hidden{
+  opacity: 0;           /* 看不见 */
+  font-size: 0;         /* 文本零宽 */
+  line-height: 0;
+  letter-spacing: 0;
+  pointer-events: none; /* 不拦截点击/选择 */
+  user-select: none;
+  display: inline-block;
+  width: 0;             /* 元素自身零宽 */
+  overflow: hidden;
+}
+
 
 /* 外包对齐：让包裹内容成块并对齐（跨多段也会逐段生效） */
 .lbmf-align { display: block; width: 100%; }
