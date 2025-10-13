@@ -123,34 +123,11 @@ export default class ProseMirrorEditorDriver {
     };
     // =====================================================
 
-    // —— 组合态状态，仅用于“延后同步”，不拦事件 ——
+    // —— IME 组合输入护栏（不拦截输入，只延迟对外同步）——
     this._isComposing = false;
-
-    // —— 同步节流（合并多次事务）——
-    this._syncScheduled = false;
-    this._scheduleSafeSync = () => {
-      if (this._syncScheduled) return;
-      this._syncScheduled = true;
-
-      const tryFlush = () => {
-        this._syncScheduled = false;
-
-        // 若仍处于组合中，则稍后重试（不阻断编辑，不丢失内容）
-        if (this._isComposing || this.view.composing) {
-          setTimeout(this._scheduleSafeSync, 50);
-          return;
-        }
-
-        const newDocPlaintext = this.serializeContent(this.view.state.doc, this.schema);
-        this.attrs.oninput(newDocPlaintext);
-      };
-
-      if (typeof requestAnimationFrame === 'function') {
-        requestAnimationFrame(tryFlush);
-      } else {
-        setTimeout(tryFlush, 0);
-      }
-    };
+    this._suppressOnInput = false;
+    this._pendingOnInput = false;
+    this._composeWatchdog = null; // 防止 compositionend 丢失导致卡死
   }
 
   buildEditorStateConfig() {
@@ -171,7 +148,7 @@ export default class ProseMirrorEditorDriver {
     items.add('richTextKeymap', keymap(richTextKeymap(this.schema)));
     items.add('baseKeymap', keymap(baseKeymap));
     items.add('placeholder', placeholderPlugin(this.attrs.placeholder));
-    items.add('history', history()); // ← 修正：去掉多余的右括号
+    items.add('history', history());
     items.add('disabled', disabledPlugin());
     items.add('disableBase64Paste', disableBase64PastePlugin());
     items.add('dropCursor', dropCursor());
@@ -185,36 +162,80 @@ export default class ProseMirrorEditorDriver {
   buildEditorProps() {
     const self = this;
 
+    const FLUSH_AFTER_COMPOSITION_MS = 40;
+    const WATCHDOG_MS = 5000; // 兜底：5 秒未收到 compositionend 则自动结束
+
+    const flushOnInput = () => {
+      const newDocPlaintext = self.serializeContent(self.view.state.doc, self.schema);
+      self.attrs.oninput(newDocPlaintext);
+    };
+
+    const startWatchdog = () => {
+      clearTimeout(self._composeWatchdog);
+      self._composeWatchdog = setTimeout(() => {
+        // 强制结束组合态，避免卡死
+        self._isComposing = false;
+        self._suppressOnInput = false;
+        if (self._pendingOnInput) {
+          self._pendingOnInput = false;
+          flushOnInput();
+        } else {
+          flushOnInput();
+        }
+      }, WATCHDOG_MS);
+    };
+
+    const stopWatchdog = () => {
+      clearTimeout(self._composeWatchdog);
+      self._composeWatchdog = null;
+    };
+
     return {
       state: this.state,
 
-      // 仅记录组合态，不拦截任何输入事件
+      // 关键：不拦截任何输入事件，只做组合态标记与对外同步节流
       handleDOMEvents: {
         compositionstart: () => {
           self._isComposing = true;
+          self._suppressOnInput = true;
+          startWatchdog();
+          return false; // 切记不阻止默认
+        },
+        compositionupdate: () => {
+          // 让浏览器与 PM 自行维护 DOM，避免干预
           return false;
         },
-        compositionupdate: () => false,
         compositionend: () => {
           self._isComposing = false;
-          self._scheduleSafeSync(); // 组合结束立即同步一次
+          stopWatchdog();
+          // 给浏览器/PM 一个极短的时间把组合文本同步，再统一上报
+          setTimeout(() => {
+            self._suppressOnInput = false;
+            if (self._pendingOnInput) self._pendingOnInput = false;
+            flushOnInput();
+          }, FLUSH_AFTER_COMPOSITION_MS);
           return false;
         },
-        blur: () => {
-          self._isComposing = false;
-          self._scheduleSafeSync(); // 失焦兜底
-          return false;
-        },
+        // 不再对 beforeinput 做任何 preventDefault/return true
+        beforeinput: () => false,
+        input: () => false,
       },
 
-      // 让 ProseMirror 原生处理所有输入；不实现 beforeinput/handleTextInput
+      // 同样地，不在 handleTextInput 中做任何“去重/拦截”
+      handleTextInput() {
+        return false;
+      },
 
       dispatchTransaction(transaction) {
         const newState = this.state.apply(transaction);
         this.updateState(newState);
 
-        // 每个事务合并为一次安全同步（组合态自动延后）
-        self._scheduleSafeSync();
+        // 组合期间不立刻向外同步，结束后统一一次
+        if (self._suppressOnInput) {
+          self._pendingOnInput = true;
+          return;
+        }
+        flushOnInput();
       },
     };
   }
