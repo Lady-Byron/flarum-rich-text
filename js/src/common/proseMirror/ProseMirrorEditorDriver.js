@@ -40,6 +40,7 @@ export default class ProseMirrorEditorDriver {
     // ===== textarea 兼容层（完全模拟字符串下标语义）=====
     const self = this;
 
+    // PM 位置 <-> 纯文本字符下标 映射
     const TEXT_SEP = '\n';
     const textAll = () =>
       self.view.state.doc.textBetween(0, self.view.state.doc.content.size, TEXT_SEP, TEXT_SEP);
@@ -48,6 +49,7 @@ export default class ProseMirrorEditorDriver {
       self.view.state.doc.textBetween(0, pos, TEXT_SEP, TEXT_SEP).length;
 
     const charIdxToPos = (idx) => {
+      // 二分：找最小 pos 使 textBetween(0,pos).length >= idx
       let lo = 0;
       let hi = self.view.state.doc.content.size;
       const total = textAll().length;
@@ -61,10 +63,14 @@ export default class ProseMirrorEditorDriver {
       return lo;
     };
 
+    // 供 styleSelectedText / insertText.ts 使用
     this.el = {
+      // 聚焦
       focus() {
         self.view.focus();
       },
+
+      // value：字符串 getter + setter（整篇替换）
       get value() {
         return textAll();
       },
@@ -79,10 +85,14 @@ export default class ProseMirrorEditorDriver {
           });
           self.view.updateState(newState);
         } catch (e) {
-          self.view.dispatch(self.view.state.tr.insertText(s, 0, self.view.state.doc.content.size));
+          self.view.dispatch(
+            self.view.state.tr.insertText(s, 0, self.view.state.doc.content.size)
+          );
         }
         self.view.focus();
       },
+
+      // selectionStart/End：字符下标语义（含 setter）
       get selectionStart() {
         return posToCharIdx(self.view.state.selection.from);
       },
@@ -97,7 +107,9 @@ export default class ProseMirrorEditorDriver {
         const start = this.selectionStart;
         this.setSelectionRange(start, Number(v));
       },
-      setRangeText(text, start, end) {
+
+      // setRangeText：把字符区间映射为 PM 位置后替换
+      setRangeText(text, start, end /*, mode */) {
         const s =
           typeof start === 'number' ? charIdxToPos(start) : charIdxToPos(this.selectionStart);
         const e =
@@ -105,6 +117,8 @@ export default class ProseMirrorEditorDriver {
         self.view.dispatch(self.view.state.tr.insertText(String(text), s, e));
         self.view.focus();
       },
+
+      // setSelectionRange：字符下标 -> PM 位置
       setSelectionRange(start, end) {
         const s = charIdxToPos(start);
         const e = charIdxToPos(end);
@@ -113,9 +127,13 @@ export default class ProseMirrorEditorDriver {
         self.view.dispatch(self.view.state.tr.setSelection(new TextSelection($s, $e)));
         self.view.focus();
       },
-      dispatchEvent() {
+
+      // insertText.ts 回退会调这个；no-op 即可
+      dispatchEvent(/* ev */) {
         return true;
       },
+
+      // 兼容 insertText.ts 临时设置 contentEditable
       set contentEditable(_v) {},
       get contentEditable() {
         return 'false';
@@ -123,11 +141,16 @@ export default class ProseMirrorEditorDriver {
     };
     // =====================================================
 
-    // —— IME 组合输入护栏（不拦截输入，只延迟对外同步）——
-    this._isComposing = false;
-    this._suppressOnInput = false;
-    this._pendingOnInput = false;
-    this._composeWatchdog = null; // 防止 compositionend 丢失导致卡死
+    const callInputListeners = (e) => {
+      this.attrs.inputListeners.forEach((listener) => {
+        listener.call(target);
+      });
+      e.redraw = false;
+    };
+
+    target.oninput = callInputListeners;
+    target.onclick = callInputListeners;
+    target.onkeyup = callInputListeners;
   }
 
   buildEditorStateConfig() {
@@ -161,81 +184,15 @@ export default class ProseMirrorEditorDriver {
 
   buildEditorProps() {
     const self = this;
-
-    const FLUSH_AFTER_COMPOSITION_MS = 40;
-    const WATCHDOG_MS = 5000; // 兜底：5 秒未收到 compositionend 则自动结束
-
-    const flushOnInput = () => {
-      const newDocPlaintext = self.serializeContent(self.view.state.doc, self.schema);
-      self.attrs.oninput(newDocPlaintext);
-    };
-
-    const startWatchdog = () => {
-      clearTimeout(self._composeWatchdog);
-      self._composeWatchdog = setTimeout(() => {
-        // 强制结束组合态，避免卡死
-        self._isComposing = false;
-        self._suppressOnInput = false;
-        if (self._pendingOnInput) {
-          self._pendingOnInput = false;
-          flushOnInput();
-        } else {
-          flushOnInput();
-        }
-      }, WATCHDOG_MS);
-    };
-
-    const stopWatchdog = () => {
-      clearTimeout(self._composeWatchdog);
-      self._composeWatchdog = null;
-    };
-
     return {
       state: this.state,
-
-      // 关键：不拦截任何输入事件，只做组合态标记与对外同步节流
-      handleDOMEvents: {
-        compositionstart: () => {
-          self._isComposing = true;
-          self._suppressOnInput = true;
-          startWatchdog();
-          return false; // 切记不阻止默认
-        },
-        compositionupdate: () => {
-          // 让浏览器与 PM 自行维护 DOM，避免干预
-          return false;
-        },
-        compositionend: () => {
-          self._isComposing = false;
-          stopWatchdog();
-          // 给浏览器/PM 一个极短的时间把组合文本同步，再统一上报
-          setTimeout(() => {
-            self._suppressOnInput = false;
-            if (self._pendingOnInput) self._pendingOnInput = false;
-            flushOnInput();
-          }, FLUSH_AFTER_COMPOSITION_MS);
-          return false;
-        },
-        // 不再对 beforeinput 做任何 preventDefault/return true
-        beforeinput: () => false,
-        input: () => false,
-      },
-
-      // 同样地，不在 handleTextInput 中做任何“去重/拦截”
-      handleTextInput() {
-        return false;
-      },
-
       dispatchTransaction(transaction) {
         const newState = this.state.apply(transaction);
         this.updateState(newState);
 
-        // 组合期间不立刻向外同步，结束后统一一次
-        if (self._suppressOnInput) {
-          self._pendingOnInput = true;
-          return;
-        }
-        flushOnInput();
+        const newDoc = this.state.doc;
+        const newDocPlaintext = self.serializeContent(newDoc, self.schema);
+        self.attrs.oninput(newDocPlaintext);
       },
     };
   }
