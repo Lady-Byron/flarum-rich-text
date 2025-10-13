@@ -145,7 +145,6 @@ export default class ProseMirrorEditorDriver {
         this.attrs.oninput(newDocPlaintext);
       };
 
-      // 用 rAF 把所有同帧事务合并为一次上报，避免外层回写打断
       if (typeof requestAnimationFrame === 'function') {
         requestAnimationFrame(tryFlush);
       } else {
@@ -172,7 +171,7 @@ export default class ProseMirrorEditorDriver {
     items.add('richTextKeymap', keymap(richTextKeymap(this.schema)));
     items.add('baseKeymap', keymap(baseKeymap));
     items.add('placeholder', placeholderPlugin(this.attrs.placeholder));
-    items.add('history', history()));
+    items.add('history', history()); // ← 修正：去掉多余的右括号
     items.add('disabled', disabledPlugin());
     items.add('disableBase64Paste', disableBase64PastePlugin());
     items.add('dropCursor', dropCursor());
@@ -189,7 +188,7 @@ export default class ProseMirrorEditorDriver {
     return {
       state: this.state,
 
-      // 只记录组合态，绝不拦截
+      // 仅记录组合态，不拦截任何输入事件
       handleDOMEvents: {
         compositionstart: () => {
           self._isComposing = true;
@@ -198,27 +197,23 @@ export default class ProseMirrorEditorDriver {
         compositionupdate: () => false,
         compositionend: () => {
           self._isComposing = false;
-          // 组合立刻安排一次同步，确保外层拿到最终值
-          self._scheduleSafeSync();
+          self._scheduleSafeSync(); // 组合结束立即同步一次
           return false;
         },
         blur: () => {
-          // 失焦也强制同步一次，兜底
           self._isComposing = false;
-          self._scheduleSafeSync();
+          self._scheduleSafeSync(); // 失焦兜底
           return false;
         },
       },
 
-      // 不做任何自定义文本处理，全部交给 PM（IME 可靠）
-      // handleTextInput: 不实现
-      // beforeinput: 不实现
+      // 让 ProseMirror 原生处理所有输入；不实现 beforeinput/handleTextInput
 
       dispatchTransaction(transaction) {
         const newState = this.state.apply(transaction);
         this.updateState(newState);
 
-        // 每个事务合并为一次安全同步（组合态会自动延后）
+        // 每个事务合并为一次安全同步（组合态自动延后）
         self._scheduleSafeSync();
       },
     };
