@@ -205,3 +205,32 @@ li.ProseMirror-selectednode:after {
 .ProseMirror-focused .ProseMirror-gapcursor {
     display: block;
 }
+
+
+/* 标签本体在编辑区隐藏（或弱化显示请改成 opacity:.35） */
+.lbmf-tag-hidden { display: none; }
+
+/* 外包对齐：让包裹内容成块并对齐（跨多段也会逐段生效） */
+.lbmf-align { display: block; width: 100%; }
+.lbmf-center { text-align: center; }
+.lbmf-right  { text-align: right;  }
+
+/* 兼容旧的 [lb-indent]：首行缩进 2em */
+.lbmf-first-indent {
+  display: block;
+  text-indent: 2em;
+}
+
+/* 空白段占位，与后端 <span class="lb-blank"> 对齐 */
+.lb-blank {
+  display: block;
+  height: 1.2em;         /* 你也可以用 margin 提示空白 */
+  line-height: 1.2em;
+}
+
+/* 新式缩进块：1 个 = 1em，可连写 */
+.lb-i {
+  display: inline-block;
+  width: 1em;
+  white-space: pre;
+}
