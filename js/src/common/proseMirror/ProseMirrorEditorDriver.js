@@ -184,8 +184,66 @@ export default class ProseMirrorEditorDriver {
 
   buildEditorProps() {
     const self = this;
+
+    // === 仅列表环境下的“全角/宽字符相邻重复去重” ===
+    // 判定全角/宽字符
+    const isFullWidth = (ch) => {
+      if (!ch) return false;
+      const c = ch.charCodeAt(0);
+      if (c >= 0x3000 && c <= 0x303F) return true;      // CJK 符号/标点
+      if (c >= 0xFF01 && c <= 0xFF60) return true;      // 全角 ASCII 变体
+      if (c >= 0xFFE0 && c <= 0xFFE6) return true;      // 全角货币等
+      if (c === 0x2014 || c === 0x2026 || c === 0x2018 || c === 0x2019 || c === 0x201C || c === 0x201D) return true;
+      return false;
+    };
+    // 是否处在列表
+    const inList = (state) => {
+      const $pos = state.selection.$from;
+      for (let d = $pos.depth; d >= 0; d--) {
+        const name = $pos.node(d)?.type?.name;
+        if (name === 'list_item' || name === 'bullet_list' || name === 'ordered_list') return true;
+      }
+      return false;
+    };
+    // 取光标左侧 1 字符
+    const charLeftOf = (view, from) => {
+      const s = Math.max(0, from - 2);
+      const t = view.state.doc.textBetween(s, from, '\n', '\n');
+      return t.slice(-1);
+    };
+    // 简单的“短时间窗口 + 相邻位置”去重
+    let lastChar = '';
+    let lastPos = -1;
+    let lastTs = 0;
+    const WINDOW_MS = 250;
+
     return {
       state: this.state,
+
+      // 仅在列表里，对单字符全角输入做相邻重复去重
+      handleTextInput(view, from, to, text) {
+        if (!inList(view.state)) return false;
+        if (typeof text !== 'string' || text.length !== 1 || !isFullWidth(text)) return false;
+
+        const now = Date.now();
+        const left = charLeftOf(view, from);
+        const near = from === lastPos || from === lastPos + 1;
+        const fast = now - lastTs <= WINDOW_MS;
+
+        if (left === text && lastChar === text && near && fast) {
+          // 吞掉重复插入
+          lastChar = text;
+          lastPos = from;
+          lastTs = now;
+          return true;
+        }
+
+        lastChar = text;
+        lastPos = from;
+        lastTs = now;
+        return false;
+      },
+
       dispatchTransaction(transaction) {
         const newState = this.state.apply(transaction);
         this.updateState(newState);
