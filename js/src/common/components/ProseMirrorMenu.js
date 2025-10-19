@@ -6,7 +6,7 @@ import ItemList from 'flarum/common/utils/ItemList';
 import CommandButton from './CommandButton';
 import MarkButton from './MarkButton';
 import NodeTypeDropdown from './NodeTypeDropdown';
-/* import InsertImageDropdown from './InsertImageDropdown'; */
+// import InsertImageDropdown from './InsertImageDropdown';
 import InsertLinkDropdown from './InsertLinkDropdown';
 import ListButton from './ListButton';
 import insertHr from '../proseMirror/commands/insertHr';
@@ -18,6 +18,7 @@ export default class ProseMirrorMenu extends Component {
 
     this.modifierKey = navigator.userAgent.match(/Macintosh/) ? '⌘' : 'ctrl';
   }
+
   view(vnode) {
     if (!this.attrs.state) return '';
 
@@ -106,14 +107,15 @@ export default class ProseMirrorMenu extends Component {
       80
     );
 
+    // Spoiler（行内）从“更多”移到常显（占用原 code 位置权重 70）
     items.add(
-      'code',
+      'spoiler_inline',
       MarkButton.component({
-        type: 'code',
-        icon: 'fas fa-code',
-        tooltip: app.translator.trans('askvortsov-rich-text.lib.composer.code_tooltip', { modifierKey }),
+        type: 'spoiler_inline',
+        icon: 'fas fa-eye-slash',
+        tooltip: app.translator.trans('askvortsov-rich-text.lib.composer.spoiler_inline_tooltip', { modifierKey }),
         state: state,
-        mark: state.getSchema().marks.code,
+        mark: state.getSchema().marks.spoiler_inline,
       }),
       70
     );
@@ -142,18 +144,20 @@ export default class ProseMirrorMenu extends Component {
       50
     );
 
-/*    items.add(
- *     'image',
- *     InsertImageDropdown.component({
- *       type: 'image',
- *       icon: 'fas fa-image',
- *       tooltip: app.translator.trans('askvortsov-rich-text.lib.composer.image_tooltip'),
- *       state: state,
- *       node: state.getSchema().nodes.image,
- *     }),
- *     40
- *   );
- */
+    // 图片按钮已注释掉（可以随时恢复）
+    /*
+    items.add(
+      'image',
+      InsertImageDropdown.component({
+        type: 'image',
+        icon: 'fas fa-image',
+        tooltip: app.translator.trans('askvortsov-rich-text.lib.composer.image_tooltip'),
+        state: state,
+        node: state.getSchema().nodes.image,
+      }),
+      40
+    );
+    */
 
     items.add(
       'unordered_list',
@@ -165,18 +169,6 @@ export default class ProseMirrorMenu extends Component {
         listType: state.getSchema().nodes.bullet_list,
       }),
       30
-    );
-
-    items.add(
-      'ordered_list',
-      ListButton.component({
-        type: 'ordered_list',
-        icon: 'fas fa-list-ol',
-        tooltip: app.translator.trans('askvortsov-rich-text.lib.composer.ordered_list_tooltip', { modifierKey }),
-        state: state,
-        listType: state.getSchema().nodes.ordered_list,
-      }),
-      20
     );
 
     items.add(
@@ -197,6 +189,30 @@ export default class ProseMirrorMenu extends Component {
     const items = new ItemList();
     const state = this.attrs.state;
     const modifierKey = this.modifierKey;
+
+    // Code（行内）移动到“更多”
+    items.add(
+      'code',
+      MarkButton.component({
+        type: 'code',
+        icon: 'fas fa-code',
+        tooltip: app.translator.trans('askvortsov-rich-text.lib.composer.code_tooltip', { modifierKey }),
+        state: state,
+        mark: state.getSchema().marks.code,
+      })
+    );
+
+    // Ordered List 移到“更多”
+    items.add(
+      'ordered_list',
+      ListButton.component({
+        type: 'ordered_list',
+        icon: 'fas fa-list-ol',
+        tooltip: app.translator.trans('askvortsov-rich-text.lib.composer.ordered_list_tooltip', { modifierKey }),
+        state: state,
+        listType: state.getSchema().nodes.ordered_list,
+      })
+    );
 
     items.add(
       'strike',
@@ -228,17 +244,6 @@ export default class ProseMirrorMenu extends Component {
         tooltip: app.translator.trans('askvortsov-rich-text.lib.composer.sup_tooltip', { modifierKey }),
         state: state,
         mark: state.getSchema().marks.sup,
-      })
-    );
-
-    items.add(
-      'spoiler_inline',
-      MarkButton.component({
-        type: 'spoiler_inline',
-        icon: 'fas fa-eye-slash',
-        tooltip: app.translator.trans('askvortsov-rich-text.lib.composer.spoiler_inline_tooltip', { modifierKey }),
-        state: state,
-        mark: state.getSchema().marks.spoiler_inline,
       })
     );
 
