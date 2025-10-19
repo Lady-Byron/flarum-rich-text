@@ -6,7 +6,7 @@ import ItemList from 'flarum/common/utils/ItemList';
 import CommandButton from './CommandButton';
 import MarkButton from './MarkButton';
 import NodeTypeDropdown from './NodeTypeDropdown';
-import InsertImageDropdown from './InsertImageDropdown';
+/* import InsertImageDropdown from './InsertImageDropdown'; */
 import InsertLinkDropdown from './InsertLinkDropdown';
 import ListButton from './ListButton';
 import insertHr from '../proseMirror/commands/insertHr';
@@ -142,17 +142,18 @@ export default class ProseMirrorMenu extends Component {
       50
     );
 
-    items.add(
-      'image',
-      InsertImageDropdown.component({
-        type: 'image',
-        icon: 'fas fa-image',
-        tooltip: app.translator.trans('askvortsov-rich-text.lib.composer.image_tooltip'),
-        state: state,
-        node: state.getSchema().nodes.image,
-      }),
-      40
-    );
+/*    items.add(
+ *     'image',
+ *     InsertImageDropdown.component({
+ *       type: 'image',
+ *       icon: 'fas fa-image',
+ *       tooltip: app.translator.trans('askvortsov-rich-text.lib.composer.image_tooltip'),
+ *       state: state,
+ *       node: state.getSchema().nodes.image,
+ *     }),
+ *     40
+ *   );
+ */
 
     items.add(
       'unordered_list',
