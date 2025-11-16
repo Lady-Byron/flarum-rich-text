@@ -19,7 +19,7 @@ import MarkdownParserBuilder from './markdown/MarkdownParserBuilder';
 import SchemaBuilder from './markdown/SchemaBuilder';
 import { inputRules } from 'prosemirror-inputrules';
 import lbMoreFormatPreview from './plugins/lbMoreFormatPreview';
-// 【修复】移除 "import debounce from 'flarum/common/utils/debounce';"
+// (不导入 debounce)
 
 export default class ProseMirrorEditorDriver {
   constructor(target, attrs) {
@@ -42,9 +42,7 @@ export default class ProseMirrorEditorDriver {
   	cssClasses.forEach((className) => this.view.dom.classList.add(className));
 
   	// ===== textarea 兼容层（完全模拟字符串下标语义）=====
-  	// [此部分未更改]
   	const self = this;
-
   	const TEXT_SEP = '\n';
   	const textAll = () =>
   	  self.view.state.doc.textBetween(0, self.view.state.doc.content.size, TEXT_SEP, TEXT_SEP);
@@ -67,8 +65,6 @@ export default class ProseMirrorEditorDriver {
   	};
 
   	this.el = {
-      // ... [兼容层 this.el 内部代码未改变，保持原样] ...
-  	  // 聚焦
   	  focus() {
   	 	self.view.focus();
   	  },
@@ -134,7 +130,7 @@ export default class ProseMirrorEditorDriver {
 
 
     // 【优化 & 修复】
-    // 我们在这里实现一个内联的 debounce，而不是使用外部导入
+    // 内联的 debounce (setTimeout 实现)
     this.debouncedOnInput = () => {
         // 清除上一个待执行的计时器
         if (self.debounceTimeout) {
@@ -145,7 +141,6 @@ export default class ProseMirrorEditorDriver {
         self.debounceTimeout = setTimeout(() => {
             if (!self.view) return; // 确保编辑器未被销毁
 
-            // Bug修复：使用 this.view.state.doc 来获取最新状态
             const newDoc = self.view.state.doc;
             const newDocPlaintext = self.serializeContent(newDoc);
             self.attrs.oninput(newDocPlaintext);
@@ -168,7 +163,6 @@ export default class ProseMirrorEditorDriver {
   }
 
   buildEditorStateConfig() {
-    // ... [此方法未改变] ...
   	return {
   	  doc: this.parseInitialValue(this.attrs.value),
   	  disabled: this.attrs.disabled,
@@ -178,7 +172,6 @@ export default class ProseMirrorEditorDriver {
   }
 
   buildPluginItems() {
-  	// [此部分未更改]
   	const items = new ItemList();
   	items.add('markdownInputrules', inputRules({ rules: this.buildInputRules(this.schema) }));
   	items.add('submit', keymap({ 'Mod-Enter': this.attrs.onsubmit }));
@@ -200,14 +193,13 @@ export default class ProseMirrorEditorDriver {
   buildEditorProps() {
   	const self = this;
 
-  	// === 仅列表环境下的“全角/宽字符相邻重复去重” ===
-  	// [此部分未更改]
+  	// === CJK 列表修复 (保留) ===
   	const isFullWidth = (ch) => {
   	  if (!ch) return false;
   	  const c = ch.charCodeAt(0);
-  	  if (c >= 0x3000 && c <= 0x303F) return true; 	// CJK 符号/标点
-  	  if (c >= 0xFF01 && c <= 0xFF60) return true; 	// 全角 ASCII 变体
-  	  if (c >= 0xFFE0 && c <= 0xFFE6) return true; 	// 全角货币等
+  	  if (c >= 0x3000 && c <= 0x303F) return true;
+  	  if (c >= 0xFF01 && c <= 0xFF60) return true;
+  	  if (c >= 0xFFE0 && c <= 0xFFE6) return true;
   	  if (c === 0x2014 || c === 0x2026 || c === 0x2018 || c === 0x2019 || c === 0x201C || c === 0x201D) return true;
   	  return false;
   	};
@@ -233,7 +225,6 @@ export default class ProseMirrorEditorDriver {
   	  state: this.state,
 
   	  handleTextInput(view, from, to, text) {
-  	 	// [此部分未更改]
   	 	if (!inList(view.state)) return false;
   	 	if (typeof text !== 'string' || text.length !== 1 || !isFullWidth(text)) return false;
 
@@ -257,17 +248,14 @@ export default class ProseMirrorEditorDriver {
 
   	  dispatchTransaction(transaction) {
   	 	const newState = this.state.apply(transaction);
-        // 立即更新视图状态
   	 	this.updateState(newState); 
-
-        // 【优化】改为调用我们内联的 debounced 函数
+        // 【优化】调用内联的 debounced 函数
         self.debouncedOnInput();
   	  },
   	};
   }
 
   buildInputRules(schema) {
-    // ... [以下所有方法均未改变] ...
   	return buildInputRules(schema);
   }
 
@@ -279,7 +267,7 @@ export default class ProseMirrorEditorDriver {
   	return this.serializer.serialize(doc, { tightLists: true });
   }
 
-  // === 以下保留原 API ===
+  // === 保留的 API ===
   moveCursorTo(position) {
   	this.setSelectionRange(position, position);
   }
@@ -313,7 +301,10 @@ export default class ProseMirrorEditorDriver {
   	  start -= OFFSET_TO_REMOVE_PREFIX_NEWLINE;
   	  const parsedText = this.parseInitialValue(text);
   	  this.view.dispatch(this.view.state.tr.replaceRangeWith(start, end, parsedText));
-Such as:    	  trailingNewLines = text.match(/\s+$/)[0].split('\n').length - 1;
+      
+      // 【!!! 语法错误已修复 !!!】
+      // 下面这行代码已移除了意外插入的 "Such as:"
+  	  trailingNewLines = text.match(/\s+$/)[0].split('\n').length - 1;
   	}
 
   	this.moveCursorTo(
