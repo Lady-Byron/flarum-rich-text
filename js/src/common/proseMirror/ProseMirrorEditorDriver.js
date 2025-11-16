@@ -19,10 +19,12 @@ import MarkdownParserBuilder from './markdown/MarkdownParserBuilder';
 import SchemaBuilder from './markdown/SchemaBuilder';
 import { inputRules } from 'prosemirror-inputrules';
 import lbMoreFormatPreview from './plugins/lbMoreFormatPreview';
-import debounce from 'flarum/common/utils/debounce'; // <-- 【优化】导入 Debounce
+// 【修复】移除 "import debounce from 'flarum/common/utils/debounce';"
 
 export default class ProseMirrorEditorDriver {
   constructor(target, attrs) {
+    // 【优化】为 debounce 创建一个计时器 ID 存储
+    this.debounceTimeout = null;
   	this.build(target, attrs);
   }
 
@@ -40,10 +42,9 @@ export default class ProseMirrorEditorDriver {
   	cssClasses.forEach((className) => this.view.dom.classList.add(className));
 
   	// ===== textarea 兼容层（完全模拟字符串下标语义）=====
-  	// [此部分未更改，保留了 vCurrent 的核心功能]
+  	// [此部分未更改]
   	const self = this;
 
-  	// PM 位置 <-> 纯文本字符下标 映射
   	const TEXT_SEP = '\n';
   	const textAll = () =>
   	  self.view.state.doc.textBetween(0, self.view.state.doc.content.size, TEXT_SEP, TEXT_SEP);
@@ -52,7 +53,6 @@ export default class ProseMirrorEditorDriver {
   	  self.view.state.doc.textBetween(0, pos, TEXT_SEP, TEXT_SEP).length;
 
   	const charIdxToPos = (idx) => {
-  	  // 二分：找最小 pos 使 textBetween(0,pos).length >= idx
   	  let lo = 0;
   	  let hi = self.view.state.doc.content.size;
   	  const total = textAll().length;
@@ -66,14 +66,12 @@ export default class ProseMirrorEditorDriver {
   	  return lo;
   	};
 
-  	// 供 styleSelectedText / insertText.ts 使用
   	this.el = {
+      // ... [兼容层 this.el 内部代码未改变，保持原样] ...
   	  // 聚焦
   	  focus() {
   	 	self.view.focus();
   	  },
-
-  	  // value：字符串 getter + setter（整篇替换）
   	  get value() {
   	 	return textAll();
   	  },
@@ -94,8 +92,6 @@ export default class ProseMirrorEditorDriver {
   	 	}
   	 	self.view.focus();
   	  },
-
-  	  // selectionStart/End：字符下标语义（含 setter）
   	  get selectionStart() {
   	 	return posToCharIdx(self.view.state.selection.from);
   	  },
@@ -110,8 +106,6 @@ export default class ProseMirrorEditorDriver {
   	 	const start = this.selectionStart;
   	 	this.setSelectionRange(start, Number(v));
   	  },
-
-  	  // setRangeText：把字符区间映射为 PM 位置后替换
   	  setRangeText(text, start, end /*, mode */) {
   	 	const s =
   	 	  typeof start === 'number' ? charIdxToPos(start) : charIdxToPos(this.selectionStart);
@@ -120,8 +114,6 @@ export default class ProseMirrorEditorDriver {
   	 	self.view.dispatch(self.view.state.tr.insertText(String(text), s, e));
   	 	self.view.focus();
   	  },
-
-  	  // setSelectionRange：字符下标 -> PM 位置
   	  setSelectionRange(start, end) {
   	 	const s = charIdxToPos(start);
   	 	const e = charIdxToPos(end);
@@ -130,13 +122,9 @@ export default class ProseMirrorEditorDriver {
   	 	self.view.dispatch(self.view.state.tr.setSelection(new TextSelection($s, $e)));
   	 	self.view.focus();
   	  },
-
-  	  // insertText.ts 回退会调这个；no-op 即可
   	  dispatchEvent(/* ev */) {
   	 	return true;
   	  },
-
-  	  // 兼容 insertText.ts 临时设置 contentEditable
   	  set contentEditable(_v) {},
   	  get contentEditable() {
   	 	return 'false';
@@ -144,19 +132,27 @@ export default class ProseMirrorEditorDriver {
   	};
   	// =====================================================
 
-    // <-- 【优化】创建 Debounced 函数
-    // 这将序列化和 oninput 调用延迟到用户停止输入 250 毫秒后
-    this.debouncedOnInput = debounce(() => {
-        // 确保 view 仍然存在
-        if (!this.view) return;
 
-        // 【优化 & Bug修复】
-        // 在这里获取最新的 state.doc (而不是在 dispatchTransaction 中获取旧的)
-        // 并执行昂贵的序列化 + oninput 调用
-        const newDoc = this.view.state.doc;
-        const newDocPlaintext = this.serializeContent(newDoc);
-        this.attrs.oninput(newDocPlaintext);
-    }, 250);
+    // 【优化 & 修复】
+    // 我们在这里实现一个内联的 debounce，而不是使用外部导入
+    this.debouncedOnInput = () => {
+        // 清除上一个待执行的计时器
+        if (self.debounceTimeout) {
+            clearTimeout(self.debounceTimeout);
+        }
+
+        // 创建一个新的计时器
+        self.debounceTimeout = setTimeout(() => {
+            if (!self.view) return; // 确保编辑器未被销毁
+
+            // Bug修复：使用 this.view.state.doc 来获取最新状态
+            const newDoc = self.view.state.doc;
+            const newDocPlaintext = self.serializeContent(newDoc);
+            self.attrs.oninput(newDocPlaintext);
+
+            self.debounceTimeout = null; // 执行完毕，清空ID
+        }, 250); // 250ms 延迟
+    };
 
 
   	const callInputListeners = (e) => {
@@ -172,6 +168,7 @@ export default class ProseMirrorEditorDriver {
   }
 
   buildEditorStateConfig() {
+    // ... [此方法未改变] ...
   	return {
   	  doc: this.parseInitialValue(this.attrs.value),
   	  disabled: this.attrs.disabled,
@@ -183,7 +180,6 @@ export default class ProseMirrorEditorDriver {
   buildPluginItems() {
   	// [此部分未更改]
   	const items = new ItemList();
-
   	items.add('markdownInputrules', inputRules({ rules: this.buildInputRules(this.schema) }));
   	items.add('submit', keymap({ 'Mod-Enter': this.attrs.onsubmit }));
   	items.add('escape', keymap({ Escape: this.attrs.escape }));
@@ -198,7 +194,6 @@ export default class ProseMirrorEditorDriver {
   	items.add('menu', menuPlugin(this.attrs.menuState));
   	items.add('toggleSpoiler', toggleSpoiler(this.schema));
   	items.add('lbMoreFormatPreview', lbMoreFormatPreview());
-
   	return items;
   }
 
@@ -206,8 +201,7 @@ export default class ProseMirrorEditorDriver {
   	const self = this;
 
   	// === 仅列表环境下的“全角/宽字符相邻重复去重” ===
-  	// [此部分未更改，保留了 vCurrent 的 CJK 修复]
-  	// 判定全角/宽字符
+  	// [此部分未更改]
   	const isFullWidth = (ch) => {
   	  if (!ch) return false;
   	  const c = ch.charCodeAt(0);
@@ -217,7 +211,6 @@ export default class ProseMirrorEditorDriver {
   	  if (c === 0x2014 || c === 0x2026 || c === 0x2018 || c === 0x2019 || c === 0x201C || c === 0x201D) return true;
   	  return false;
   	};
-  	// 是否处在列表
   	const inList = (state) => {
   	  const $pos = state.selection.$from;
   	  for (let d = $pos.depth; d >= 0; d--) {
@@ -226,13 +219,11 @@ export default class ProseMirrorEditorDriver {
   	  }
   	  return false;
   	};
-  	// 取光标左侧 1 字符
   	const charLeftOf = (view, from) => {
   	  const s = Math.max(0, from - 2);
   	  const t = view.state.doc.textBetween(s, from, '\n', '\n');
   	  return t.slice(-1);
   	};
-  	// 简单的“短时间窗口 + 相邻位置”去重
   	let lastChar = '';
   	let lastPos = -1;
   	let lastTs = 0;
@@ -241,7 +232,6 @@ export default class ProseMirrorEditorDriver {
   	return {
   	  state: this.state,
 
-  	  // 仅在列表里，对单字符全角输入做相邻重复去重
   	  handleTextInput(view, from, to, text) {
   	 	// [此部分未更改]
   	 	if (!inList(view.state)) return false;
@@ -253,7 +243,6 @@ export default class ProseMirrorEditorDriver {
   	 	const fast = now - lastTs <= WINDOW_MS;
 
   	 	if (left === text && lastChar === text && near && fast) {
-  	 	  // 吞掉重复插入
   	 	  lastChar = text;
   	 	  lastPos = from;
   	 	  lastTs = now;
@@ -267,24 +256,18 @@ export default class ProseMirrorEditorDriver {
   	  },
 
   	  dispatchTransaction(transaction) {
-  	 	// 【优化】
   	 	const newState = this.state.apply(transaction);
-        // 立即更新视图状态，确保打字的即时响应
+        // 立即更新视图状态
   	 	this.updateState(newState); 
 
-        // 【优化】
-  	 	// 移除昂贵的同步序列化和 oninput 调用
-  	 	// const newDoc = this.state.doc; // <--- 这是旧的 Bug
-  	 	// const newDocPlaintext = self.serializeContent(newDoc, self.schema);
-  	 	// self.attrs.oninput(newDocPlaintext);
-
-        // 【优化】改为调用 debounced 函数
+        // 【优化】改为调用我们内联的 debounced 函数
         self.debouncedOnInput();
   	  },
   	};
   }
 
   buildInputRules(schema) {
+    // ... [以下所有方法均未改变] ...
   	return buildInputRules(schema);
   }
 
@@ -297,7 +280,6 @@ export default class ProseMirrorEditorDriver {
   }
 
   // === 以下保留原 API ===
-  // [此部分未更改，它们被 `this.el` 兼容层在内部使用]
   moveCursorTo(position) {
   	this.setSelectionRange(position, position);
   }
@@ -331,7 +313,7 @@ export default class ProseMirrorEditorDriver {
   	  start -= OFFSET_TO_REMOVE_PREFIX_NEWLINE;
   	  const parsedText = this.parseInitialValue(text);
   	  this.view.dispatch(this.view.state.tr.replaceRangeWith(start, end, parsedText));
-  	  trailingNewLines = text.match(/\s+$/)[0].split('\n').length - 1;
+Such as:    	  trailingNewLines = text.match(/\s+$/)[0].split('\n').length - 1;
   	}
 
   	this.moveCursorTo(
@@ -377,9 +359,9 @@ export default class ProseMirrorEditorDriver {
   	this.view.focus();
   }
   destroy() {
-    // 【优化】取消任何挂起的 debounced 调用
-    if (this.debouncedOnInput && this.debouncedOnInput.cancel) {
-      this.debouncedOnInput.cancel();
+    // 【优化 & 修复】确保在销毁时清除待处理的计时器
+    if (this.debounceTimeout) {
+        clearTimeout(this.debounceTimeout);
     }
   	this.view.destroy();
   }
