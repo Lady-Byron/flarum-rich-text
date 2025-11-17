@@ -18,9 +18,12 @@ import MarkdownSerializerBuilder from './markdown/MarkdownSerializerBuilder';
 import MarkdownParserBuilder from './markdown/MarkdownParserBuilder';
 import SchemaBuilder from './markdown/SchemaBuilder';
 import { inputRules } from 'prosemirror-inputrules';
+import lbMoreFormatPreview from './plugins/lbMoreFormatPreview';
 
 export default class ProseMirrorEditorDriver {
   constructor(target, attrs) {
+    // 给 oninput 防抖用的 timer id
+    this.debounceTimeout = null;
     this.build(target, attrs);
   }
 
@@ -37,11 +40,157 @@ export default class ProseMirrorEditorDriver {
     const cssClasses = attrs.classNames || [];
     cssClasses.forEach((className) => this.view.dom.classList.add(className));
 
+    // ===== textarea 兼容层（完全模拟字符串下标语义）=====
+    const self = this;
+    const TEXT_SEP = '\n';
+
+    const textAll = () =>
+      self.view.state.doc.textBetween(
+        0,
+        self.view.state.doc.content.size,
+        TEXT_SEP,
+        TEXT_SEP
+      );
+
+    const posToCharIdx = (pos) =>
+      self.view.state.doc.textBetween(0, pos, TEXT_SEP, TEXT_SEP).length;
+
+    const charIdxToPos = (idx) => {
+      let lo = 0;
+      let hi = self.view.state.doc.content.size;
+      const total = textAll().length;
+      const target = Math.max(0, Math.min(idx, total));
+
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        const len = self.view.state.doc.textBetween(
+          0,
+          mid,
+          TEXT_SEP,
+          TEXT_SEP
+        ).length;
+        if (len < target) lo = mid + 1;
+        else hi = mid;
+      }
+
+      return lo;
+    };
+
+    // 提供给 styleSelectedText / insertText.ts 使用的 shim
+    this.el = {
+      focus() {
+        self.view.focus();
+      },
+
+      // value：整篇纯文本 getter + setter（整篇替换）
+      get value() {
+        return textAll();
+      },
+      set value(v) {
+        const s = String(v);
+
+        try {
+          const newDoc = self.parser.parse(s);
+          const newState = EditorState.create({
+            doc: newDoc,
+            schema: self.schema,
+            plugins: self.view.state.plugins,
+          });
+          self.view.updateState(newState);
+          self.state = newState;
+        } catch (e) {
+          self.view.dispatch(
+            self.view.state.tr.insertText(
+              s,
+              0,
+              self.view.state.doc.content.size
+            )
+          );
+        }
+
+        self.view.focus();
+      },
+
+      // selectionStart / selectionEnd：字符下标语义
+      get selectionStart() {
+        return posToCharIdx(self.view.state.selection.from);
+      },
+      set selectionStart(v) {
+        const end = this.selectionEnd;
+        this.setSelectionRange(Number(v), end);
+      },
+      get selectionEnd() {
+        return posToCharIdx(self.view.state.selection.to);
+      },
+      set selectionEnd(v) {
+        const start = this.selectionStart;
+        this.setSelectionRange(start, Number(v));
+      },
+
+      // setRangeText：把字符区间映射为 PM 位置后替换
+      setRangeText(text, start, end /*, mode */) {
+        const s =
+          typeof start === 'number'
+            ? charIdxToPos(start)
+            : charIdxToPos(this.selectionStart);
+        const e =
+          typeof end === 'number'
+            ? charIdxToPos(end)
+            : charIdxToPos(this.selectionEnd);
+
+        self.view.dispatch(
+          self.view.state.tr.insertText(String(text), s, e)
+        );
+        self.view.focus();
+      },
+
+      // setSelectionRange：字符下标 -> PM 位置
+      setSelectionRange(start, end) {
+        const s = charIdxToPos(start);
+        const e = charIdxToPos(end);
+        const $s = self.view.state.tr.doc.resolve(s);
+        const $e = self.view.state.tr.doc.resolve(e);
+
+        self.view.dispatch(
+          self.view.state.tr.setSelection(new TextSelection($s, $e))
+        );
+        self.view.focus();
+      },
+
+      // insertText.ts 会触发 dispatchEvent；这里 no-op 即可
+      dispatchEvent(/* ev */) {
+        return true;
+      },
+
+      // 兼容 insertText.ts 临时设置 contentEditable
+      set contentEditable(_v) {},
+      get contentEditable() {
+        return 'false';
+      },
+    };
+    // =====================================================
+
+    // oninput 防抖：减少频繁 markdown serialize 的开销
+    this.debouncedOnInput = () => {
+      if (this.debounceTimeout) {
+        clearTimeout(this.debounceTimeout);
+      }
+
+      this.debounceTimeout = setTimeout(() => {
+        this.debounceTimeout = null;
+        if (!this.view) return;
+
+        const newDoc = this.view.state.doc;
+        const newDocPlaintext = this.serializeContent(newDoc);
+        this.attrs.oninput(newDocPlaintext);
+      }, 250);
+    };
+
+    // 保留原始 inputListeners 行为
     const callInputListeners = (e) => {
       this.attrs.inputListeners.forEach((listener) => {
         listener.call(target);
       });
-
       e.redraw = false;
     };
 
@@ -62,31 +211,23 @@ export default class ProseMirrorEditorDriver {
   buildPluginItems() {
     const items = new ItemList();
 
-    items.add('markdownInputrules', inputRules({ rules: this.buildInputRules(this.schema) }));
-
+    items.add(
+      'markdownInputrules',
+      inputRules({ rules: this.buildInputRules(this.schema) })
+    );
     items.add('submit', keymap({ 'Mod-Enter': this.attrs.onsubmit }));
-
     items.add('escape', keymap({ Escape: this.attrs.escape }));
-
     items.add('richTextKeymap', keymap(richTextKeymap(this.schema)));
-
     items.add('baseKeymap', keymap(baseKeymap));
-
     items.add('placeholder', placeholderPlugin(this.attrs.placeholder));
-
     items.add('history', history());
-
     items.add('disabled', disabledPlugin());
-
     items.add('disableBase64Paste', disableBase64PastePlugin());
-
     items.add('dropCursor', dropCursor());
-
     items.add('gapCursor', gapCursor());
-
     items.add('menu', menuPlugin(this.attrs.menuState));
-
     items.add('toggleSpoiler', toggleSpoiler(this.schema));
+    items.add('lbMoreFormatPreview', lbMoreFormatPreview());
 
     return items;
   }
@@ -96,13 +237,16 @@ export default class ProseMirrorEditorDriver {
 
     return {
       state: this.state,
-      dispatchTransaction(transaction) {
-        let newState = this.state.apply(transaction);
-        this.updateState(newState);
 
-        const newDoc = this.state.doc;
-        const newDocPlaintext = self.serializeContent(newDoc, self.schema);
-        self.attrs.oninput(newDocPlaintext);
+      dispatchTransaction(transaction) {
+        const newState = this.state.apply(transaction);
+        this.updateState(newState);
+        self.state = newState;
+
+        // 只在文档变更时触发 markdown serialize + oninput（带防抖）
+        if (transaction.docChanged) {
+          self.debouncedOnInput();
+        }
       },
     };
   }
@@ -119,71 +263,33 @@ export default class ProseMirrorEditorDriver {
     return this.serializer.serialize(doc, { tightLists: true });
   }
 
-  // External Control Stuff
+  // === 外部 API（保持原有签名） ===
 
-  /**
-   * Focus the textarea and place the cursor at the given index.
-   *
-   * @param {number} position
-   */
   moveCursorTo(position) {
     this.setSelectionRange(position, position);
   }
 
-  /**
-   * Get the selected range of the textarea.
-   *
-   * @return {Array}
-   */
   getSelectionRange() {
     return [this.view.state.selection.from, this.view.state.selection.to];
   }
 
-  /**
-   * Get (at most) the last N characters from the current "text block".
-   */
   getLastNChars(n) {
     const lastNode = this.view.state.selection.$from.nodeBefore;
-
     if (!lastNode || !lastNode.text) return '';
-
     return lastNode.text.slice(Math.max(0, lastNode.text.length - n));
   }
 
-  /**
-   * Insert content into the textarea at the position of the cursor.
-   *
-   * @param {String} text
-   */
   insertAtCursor(text, escape) {
     this.insertAt(this.getSelectionRange()[0], text, escape);
     $(this.view.dom).trigger('click');
   }
 
-  /**
-   * Insert content into the textarea at the given position.
-   *
-   * @param {number} pos
-   * @param {String} text
-   */
   insertAt(pos, text, escape) {
     this.insertBetween(pos, pos, text, escape);
   }
 
-  /**
-   * Insert content into the textarea between the given positions.
-   *
-   * If the start and end positions are different, any text between them will be
-   * overwritten.
-   *
-   * @param start
-   * @param end
-   * @param text
-   * @param rawMarkdown
-   */
   insertBetween(start, end, text, escape = true) {
     let trailingNewLines = 0;
-
     const OFFSET_TO_REMOVE_PREFIX_NEWLINE = 1;
 
     if (escape) {
@@ -192,18 +298,24 @@ export default class ProseMirrorEditorDriver {
       // Without this, a newline would be added before the inserted text.
       start -= OFFSET_TO_REMOVE_PREFIX_NEWLINE;
       const parsedText = this.parseInitialValue(text);
-      this.view.dispatch(this.view.state.tr.replaceRangeWith(start, end, parsedText));
+      this.view.dispatch(
+        this.view.state.tr.replaceRangeWith(start, end, parsedText)
+      );
 
-      trailingNewLines = text.match(/\s+$/)[0].split('\n').length - 1;
+      const match = text.match(/\s+$/);
+      if (match) {
+        trailingNewLines = match[0].split('\n').length - 1;
+      }
     }
 
-    // Move the textarea cursor to the end of the content we just inserted.
-    // The offset is necessary so the new cursor position doesn't split the inserted text
-    // when the space is added below.
-    this.moveCursorTo(Math.min(start + text.length + OFFSET_TO_REMOVE_PREFIX_NEWLINE, Selection.atEnd(this.view.state.doc).to));
+    this.moveCursorTo(
+      Math.min(
+        start + text.length + OFFSET_TO_REMOVE_PREFIX_NEWLINE,
+        Selection.atEnd(this.view.state.doc).to
+      )
+    );
     m.redraw();
 
-    // TODO: accomplish this in one step.
     if (text.endsWith(' ') && !escape) {
       this.insertAtCursor(' ');
     }
@@ -215,28 +327,17 @@ export default class ProseMirrorEditorDriver {
       });
   }
 
-  /**
-   * Replace existing content from the start to the current cursor position.
-   *
-   * @param start
-   * @param text
-   */
   replaceBeforeCursor(start, text, escape) {
     this.insertBetween(start, this.getSelectionRange()[0], text, escape);
   }
 
-  /**
-   * Set the selected range of the textarea.
-   *
-   * @param {number} start
-   * @param {number} end
-   * @private
-   */
   setSelectionRange(start, end) {
     const $start = this.view.state.tr.doc.resolve(start);
     const $end = this.view.state.tr.doc.resolve(end);
 
-    this.view.dispatch(this.view.state.tr.setSelection(new TextSelection($start, $end)));
+    this.view.dispatch(
+      this.view.state.tr.setSelection(new TextSelection($start, $end))
+    );
     this.focus();
   }
 
@@ -252,11 +353,17 @@ export default class ProseMirrorEditorDriver {
   focus() {
     this.view.focus();
   }
+
   destroy() {
+    if (this.debounceTimeout) {
+      clearTimeout(this.debounceTimeout);
+    }
     this.view.destroy();
   }
 
   disabled(disabled) {
-    this.view.dispatch(this.view.state.tr.setMeta('disabled', disabled));
+    this.view.dispatch(
+      this.view.state.tr.setMeta('disabled', disabled)
+    );
   }
 }
